@@ -121,30 +121,19 @@ function EnsureViaStitchLayer(Board : IPCB_Board) : TLayer;
 Const
   kLayerName = 'Via Stitch Placement';
 Var
-  Target      : TLayer;
-  CurrentName : String;
+  Layer    : TLayer;
+  LayerObj : IPCB_LayerObject;
 begin
-  Target      := LayerUtils.MechanicalLayer(100);
-  CurrentName := Board.LayerName[Target];
+  Layer    := LayerUtils.MechanicalLayer(100);
+  LayerObj := Board.LayerStack.LayerObject[Layer];
 
-  if CurrentName = kLayerName then
+  if Assigned(LayerObj) then
   begin
-    // Layer exists and is already named correctly — nothing to do.
-  end
-  else if CurrentName = '' then
-  begin
-    // Layer exists in the board but has no name yet — name it now.
-    Board.LayerName[Target] := kLayerName;
-  end
-  else
-  begin
-    // Layer exists but carries a different name — rename it silently.
-    // Remove this branch and add a ShowMessage if you prefer to preserve
-    // an existing custom name.
-    Board.LayerName[Target] := kLayerName;
+    if LayerObj.Name <> kLayerName then
+      LayerObj.Name := kLayerName;
   end;
 
-  Result := Target;
+  Result := Layer;
 end;
 
 
