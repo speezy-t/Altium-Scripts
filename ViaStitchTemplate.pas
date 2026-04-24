@@ -174,8 +174,6 @@ begin
   Circ.Layer      := Layer;
 
   Board.AddPCBObject(Circ);
-  PCBServer.SendMessageToRobots(Board.I_ObjectAddress, c_Broadcast,
-                                PCBM_BoardRegistered, Circ.I_ObjectAddress);
 end;
 
 
