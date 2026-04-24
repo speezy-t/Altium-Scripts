@@ -41,16 +41,6 @@ Var
   GEdtInnerOffset : TEdit;
   GEdtOuterOffset : TEdit;
 
-procedure OnOKClick(Sender : TObject);
-begin
-  TForm(TButton(Sender).Owner).ModalResult := mrOK;
-end;
-
-procedure OnCancelClick(Sender : TObject);
-begin
-  TForm(TButton(Sender).Owner).ModalResult := mrCancel;
-end;
-
 // Shows the parameter dialog. Returns True if the user clicked OK.
 // DiamMils, InnerOffMils, OuterOffMils are set on return.
 function ShowParamDialog(Var DiamMils, InnerOffMils, OuterOffMils : Double) : Boolean;
@@ -95,16 +85,16 @@ begin
     GEdtOuterOffset.Width  := 90;  GEdtOuterOffset.Text  := '80';
 
     // --- Buttons ---
-    Btn           := TButton.Create(Frm); Btn.Parent := Frm;
-    Btn.Caption   := 'OK';
-    Btn.Left      := 124; Btn.Top := 136; Btn.Width := 76;
-    Btn.Default   := True;
-    Btn.OnClick   := OnOKClick;
+    Btn             := TButton.Create(Frm); Btn.Parent := Frm;
+    Btn.Caption     := 'OK';
+    Btn.Left        := 124; Btn.Top := 136; Btn.Width := 76;
+    Btn.Default     := True;
+    Btn.ModalResult := mrOK;
 
-    Btn           := TButton.Create(Frm); Btn.Parent := Frm;
-    Btn.Caption   := 'Cancel';
-    Btn.Left      := 208; Btn.Top := 136; Btn.Width := 76;
-    Btn.OnClick   := OnCancelClick;
+    Btn             := TButton.Create(Frm); Btn.Parent := Frm;
+    Btn.Caption     := 'Cancel';
+    Btn.Left        := 208; Btn.Top := 136; Btn.Width := 76;
+    Btn.ModalResult := mrCancel;
 
     if Frm.ShowModal = mrOK then
     begin
