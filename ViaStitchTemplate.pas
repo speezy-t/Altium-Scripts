@@ -118,32 +118,48 @@ end;
 // Returns the TLayer for M100, creating/naming it "Via Stitch Template"
 // if it does not already exist or has no name.
 function EnsureViaStitchLayer(Board : IPCB_Board) : TLayer;
+Const
+  kLayerName = 'Via Stitch Placement';
 Var
-  Layer    : TLayer;
-  LayerObj : IPCB_LayerObject;
+  Target   : TLayer;
+  LS       : IPCB_LayerStack;
+  LO       : IPCB_LayerObject;
+  Found    : Boolean;
 begin
-  Layer    := LayerUtils.MechanicalLayer(100);
-  LayerObj := Board.LayerStack.LayerObject[Layer];
+  Target := LayerUtils.MechanicalLayer(100);
+  Found  := False;
+  LS     := Board.LayerStack;
 
-  if Assigned(LayerObj) then
+  // Iterate the live layer stack — works correctly in Altium 19+ / 26.x
+  LO := LS.FirstLayer;
+  while Assigned(LO) do
   begin
-    if LayerObj.Name = '' then
-      LayerObj.Name := 'Via Stitch Template'
-    else if LayerObj.Name <> 'Via Stitch Template' then
-      ShowMessage('Note: M100 is already named "' + LayerObj.Name + '". ' +
-                  'Via markers will be placed on this layer regardless.');
-  end
-  else
-  begin
-    // Layer object not accessible through the stack API — warn but continue.
-    // In some Altium versions you may need to manually enable M100 in
-    // the Layer Stack Manager before running this script.
-    ShowMessage('Warning: M100 could not be confirmed in the layer stack. ' +
-                'Please ensure "Via Stitch Template" (M100) exists. ' +
-                'Markers will be placed on M100 regardless.');
+    if LO.LayerID = Target then
+    begin
+      Found := True;
+      // Silently correct the name if it differs
+      if LO.Name <> kLayerName then
+        LO.Name := kLayerName;
+      Break;
+    end;
+    LO := LS.NextLayer(LO);
   end;
 
-  Result := Layer;
+  if not Found then
+  begin
+    // Layer does not exist — add it
+    LO := LS.AddNewMechanicalLayer;
+    if Assigned(LO) then
+    begin
+      LO.Name := kLayerName;
+      Target  := LO.LayerID;   // use the ID assigned by Altium
+    end
+    else
+      ShowMessage('Could not create "' + kLayerName + '" automatically. ' +
+                  'Please add it manually in the Layer Stack Manager, then re-run.');
+  end;
+
+  Result := Target;
 end;
 
 
@@ -355,11 +371,11 @@ Var
   ROS : Double;   // outer row, small side  (R - OuterOffMils)
   ROB : Double;   // outer row, big side    (R + OuterOffMils)
 
-  // Independent segment counts for each concentric arc
-  NSegIS : Integer;
-  NSegIB : Integer;
-  NSegOS : Integer;
-  NSegOB : Integer;
+  // Segment counts driven by the inner arcs on each side.
+  // Outer arcs inherit their count from the inner arc on the same side so
+  // that outer markers fall angularly between the inner markers (true stagger).
+  NSegIS : Integer;   // inner small — also governs outer small
+  NSegIB : Integer;   // inner big   — also governs outer big
 begin
   CXM      := CoordToMils(ArcSeg.XCenter);
   CYM      := CoordToMils(ArcSeg.YCenter);
@@ -377,11 +393,9 @@ begin
   ROS := R - OuterOffMils;
   ROB := R + OuterOffMils;
 
-  // Compute independent NSeg for each concentric arc
+  // Compute segment counts from inner arcs only
   NSegIS := CalcArcNSeg(TotalRad, RIS, DiamMils);
   NSegIB := CalcArcNSeg(TotalRad, RIB, DiamMils);
-  NSegOS := CalcArcNSeg(TotalRad, ROS, DiamMils);
-  NSegOB := CalcArcNSeg(TotalRad, ROB, DiamMils);
 
   // Validate — abort if the inner small arc (most constrained) is unworkable
   if RIS <= 0.0 then
@@ -407,28 +421,23 @@ begin
   // ------------------------------------------------------------------
   //  Inner row — endpoints included (Stagger = False)
   // ------------------------------------------------------------------
-  // Small side (R - InnerOffMils)
   PlaceConcentricRow(Board, Layer, CXM, CYM, RIS,
                      StartDeg, TotalDeg, NSegIS, DiamMils, False);
-
-  // Big side (R + InnerOffMils)
   PlaceConcentricRow(Board, Layer, CXM, CYM, RIB,
                      StartDeg, TotalDeg, NSegIB, DiamMils, False);
 
   // ------------------------------------------------------------------
-  //  Outer row — staggered by half-pitch (Stagger = True)
-  //  Each side uses its own NSeg; silently skipped if radius <= 0
-  //  or if the chord constraint cannot be satisfied.
+  //  Outer row — staggered by half of the inner pitch for the same side
+  //  (Stagger = True). Outer arcs inherit NSegIS / NSegIB so markers
+  //  land exactly between the corresponding inner markers radially.
+  //  The small-side outer arc is skipped silently if its radius <= 0.
   // ------------------------------------------------------------------
-  // Big side (R + OuterOffMils) — always valid
-  if NSegOB >= 1 then
-    PlaceConcentricRow(Board, Layer, CXM, CYM, ROB,
-                       StartDeg, TotalDeg, NSegOB, DiamMils, True);
+  PlaceConcentricRow(Board, Layer, CXM, CYM, ROB,
+                     StartDeg, TotalDeg, NSegIB, DiamMils, True);
 
-  // Small side (R - OuterOffMils) — only if radius is positive and workable
-  if (ROS > 0.0) and (NSegOS >= 1) then
+  if ROS > 0.0 then
     PlaceConcentricRow(Board, Layer, CXM, CYM, ROS,
-                       StartDeg, TotalDeg, NSegOS, DiamMils, True);
+                       StartDeg, TotalDeg, NSegIS, DiamMils, True);
 end;
 
 
