@@ -333,77 +333,129 @@ procedure ProcessArc(Board        : IPCB_Board;
                      InnerOffMils : Double;
                      OuterOffMils : Double);
 Var
-  CXM, CYM   : Double;   // arc centre in mils
-  R          : Double;   // arc radius in mils
-  StartDeg   : Double;   // start angle in degrees (Altium CCW convention)
-  TotalDeg   : Double;   // total CCW sweep in degrees
-  TotalRad   : Double;   // total CCW sweep in radians
+  CXM, CYM    : Double;   // arc centre in mils
+  R           : Double;   // arc radius in mils
+  StartDeg    : Double;   // start angle in degrees (Altium CCW convention)
+  TotalDeg    : Double;   // total CCW sweep in degrees
+  TotalRad    : Double;   // total CCW sweep in radians
 
-  // The four concentric arc radii
-  RIS : Double;   // inner row, small side  (R - InnerOffMils)
-  RIB : Double;   // inner row, big side    (R + InnerOffMils)
-  ROS : Double;   // outer row, small side  (R - OuterOffMils)
-  ROB : Double;   // outer row, big side    (R + OuterOffMils)
+  RIS : Double;           // inner row, small side  (R - InnerOffMils)
+  RIB : Double;           // inner row, big side    (R + InnerOffMils)
+  ROS : Double;           // outer row, small side  (R - OuterOffMils)
+  ROB : Double;           // outer row, big side    (R + OuterOffMils)
 
-  // Segment counts driven by the inner arcs on each side.
-  // Outer arcs inherit their count from the inner arc on the same side so
-  // that outer markers fall angularly between the inner markers (true stagger).
-  NSegIS : Integer;   // inner small — also governs outer small stagger reference
-  NSegIB : Integer;   // inner big
-  NSegOS : Integer;   // outer small — independently calculated
+  NSegIS : Integer;       // inner small segment count
+  NSegIB : Integer;       // inner big segment count
+  NSegOS : Integer;       // outer small segment count (independent)
+
+  // Virtual endpoint geometry for the outer small arc
+  PitchDeg  : Double;     // angular pitch of inner small arc (TotalDeg / NSegIS)
+  VStartDeg : Double;     // virtual start = first stagger position of inner small
+  VTotalDeg : Double;     // span from VStartDeg to virtual end
+  VTotalRad : Double;
+
   MinAngleOS  : Double;   // minimum angular step for chord >= DiamMils at ROS
-  MidAngleRad : Double;   // midpoint of original arc in radians (fallback use)
-  CX, CY      : Double;   // scratch coordinates for fallback markers
+  MidAngleRad : Double;   // midpoint of original arc in radians
+  AngleRad    : Double;
+  CX, CY      : Double;
 begin
   CXM      := CoordToMils(ArcSeg.XCenter);
   CYM      := CoordToMils(ArcSeg.YCenter);
   R        := CoordToMils(ArcSeg.Radius);
   StartDeg := ArcSeg.StartAngle;
 
-  // Total CCW sweep; add 360 if EndAngle <= StartAngle
   TotalDeg := ArcSeg.EndAngle - StartDeg;
   if TotalDeg <= 0.0 then TotalDeg := TotalDeg + 360.0;
   TotalRad := TotalDeg * Pi / 180.0;
 
-  // Compute the four radii
   RIS := R - InnerOffMils;
   RIB := R + InnerOffMils;
   ROS := R - OuterOffMils;
   ROB := R + OuterOffMils;
 
-  // Compute segment counts from inner arcs only
   NSegIS := CalcArcNSeg(TotalRad, RIS, DiamMils);
   NSegIB := CalcArcNSeg(TotalRad, RIB, DiamMils);
 
-  // Midpoint angle used for all single-marker fallbacks below
   MidAngleRad := (StartDeg + TotalDeg / 2.0) * Pi / 180.0;
 
-  // Validate — silent fallback if inner small arc geometry is impossible
-  if RIS <= 0.0 then
-    Exit;  // inner offset >= arc radius: nothing useful can be placed
+  // Geometry impossible — inner offset exceeds arc radius
+  if RIS <= 0.0 then Exit;
 
+  // ------------------------------------------------------------------
+  //  Inner small arc
+  //  If the arc is too short for even one segment, place a single
+  //  fallback marker at the midpoint and continue (do NOT exit —
+  //  the large-side arcs must still be placed).
+  // ------------------------------------------------------------------
   if NSegIS < 1 then
   begin
-    // Arc too small for inner small row — place single marker at RIS midpoint
     PlaceCircle(Board, Layer,
                 MilsToCoord(CXM + RIS * Cos(MidAngleRad)),
                 MilsToCoord(CYM + RIS * Sin(MidAngleRad)),
                 DiamMils / 2.0);
-    Exit;
+    // Small outer arc is skipped when NSegIS = 0 (no stagger reference)
+  end
+  else
+  begin
+    PlaceConcentricRow(Board, Layer, CXM, CYM, RIS,
+                       StartDeg, TotalDeg, NSegIS, DiamMils, False);
+
+    // ----------------------------------------------------------------
+    //  Outer small arc — virtual-endpoint stagger + independent partition
+    //
+    //  Virtual endpoints mirror the stagger of the outer arcs:
+    //    VStartDeg = StartDeg + 0.5 * pitch
+    //    VEndDeg   = StartDeg + (NSegIS - 0.5) * pitch
+    //    VTotalDeg = (NSegIS - 1) * pitch
+    //
+    //  The arc is then partitioned independently within [VStart, VEnd]
+    //  such that chord at ROS >= DiamMils.
+    //  Fallback: if ROS <= 0, or the virtual arc is too short to fit
+    //  even one segment, place a single marker at ROS at the arc
+    //  midpoint (StartDeg + TotalDeg/2).  If ROS is also <= 0 there
+    //  is nowhere to place it, so skip silently.
+    // ----------------------------------------------------------------
+    if (ROS > 0.0) and (DiamMils < 2.0 * ROS) then
+    begin
+      PitchDeg  := TotalDeg / NSegIS;
+      VStartDeg := StartDeg + 0.5 * PitchDeg;
+      VTotalDeg := (NSegIS - 1) * PitchDeg;   // VEndDeg = VStartDeg + VTotalDeg
+      VTotalRad := VTotalDeg * Pi / 180.0;
+
+      MinAngleOS := 2.0 * SafeArcSin(DiamMils / (2.0 * ROS));
+
+      if VTotalRad > 0.0 then
+        NSegOS := Trunc(VTotalRad / MinAngleOS)
+      else
+        NSegOS := 0;
+
+      if NSegOS >= 1 then
+      begin
+        // Place NSegOS + 1 markers from VStartDeg to VEndDeg inclusive
+        PlaceConcentricRow(Board, Layer, CXM, CYM, ROS,
+                           VStartDeg, VTotalDeg, NSegOS, DiamMils, False);
+      end
+      else
+      begin
+        // Virtual arc too short — single marker at ROS at original arc midpoint
+        AngleRad := MidAngleRad;
+        CX := CXM + ROS * Cos(AngleRad);
+        CY := CYM + ROS * Sin(AngleRad);
+        PlaceCircle(Board, Layer, MilsToCoord(CX), MilsToCoord(CY), DiamMils / 2.0);
+      end;
+    end;
+    // ROS <= 0 or via diameter >= 2*ROS: silently skip (no fallback at RIS
+    // to avoid overlap with the inner small arc markers already placed there)
   end;
 
   // ------------------------------------------------------------------
-  //  Inner row — endpoints included (Stagger = False)
+  //  Inner big arc
   // ------------------------------------------------------------------
-  PlaceConcentricRow(Board, Layer, CXM, CYM, RIS,
-                     StartDeg, TotalDeg, NSegIS, DiamMils, False);
-
   if NSegIB >= 1 then
     PlaceConcentricRow(Board, Layer, CXM, CYM, RIB,
                        StartDeg, TotalDeg, NSegIB, DiamMils, False)
   else
   begin
-    // Inner big arc too small — single marker at RIB midpoint
     PlaceCircle(Board, Layer,
                 MilsToCoord(CXM + RIB * Cos(MidAngleRad)),
                 MilsToCoord(CYM + RIB * Sin(MidAngleRad)),
@@ -411,43 +463,11 @@ begin
   end;
 
   // ------------------------------------------------------------------
-  //  Outer big arc — staggered, inherits NSegIB pitch (Stagger = True)
+  //  Outer big arc — staggered, inherits NSegIB pitch
   // ------------------------------------------------------------------
-  PlaceConcentricRow(Board, Layer, CXM, CYM, ROB,
-                     StartDeg, TotalDeg, NSegIB, DiamMils, True);
-
-  // ------------------------------------------------------------------
-  //  Outer small arc — independently partitioned, endpoints included.
-  //  Uses chord >= DiamMils (Trunc rather than the strict > in CalcArcNSeg).
-  //  Falls back to a single marker at RIS midpoint if ROS is too small.
-  // ------------------------------------------------------------------
-  if (ROS <= 0.0) or (DiamMils >= 2.0 * ROS) then
-  begin
-    // ROS non-existent or via too large — single fallback at RIS midpoint
-    PlaceCircle(Board, Layer,
-                MilsToCoord(CXM + RIS * Cos(MidAngleRad)),
-                MilsToCoord(CYM + RIS * Sin(MidAngleRad)),
-                DiamMils / 2.0);
-  end
-  else
-  begin
-    MinAngleOS := 2.0 * SafeArcSin(DiamMils / (2.0 * ROS));
-    NSegOS     := Trunc(TotalRad / MinAngleOS);
-    if NSegOS < 1 then
-    begin
-      // Still too small — single fallback at RIS midpoint
-      PlaceCircle(Board, Layer,
-                  MilsToCoord(CXM + RIS * Cos(MidAngleRad)),
-                  MilsToCoord(CYM + RIS * Sin(MidAngleRad)),
-                  DiamMils / 2.0);
-    end
-    else
-    begin
-      // Normal case — place endpoints-inclusive row at ROS
-      PlaceConcentricRow(Board, Layer, CXM, CYM, ROS,
-                         StartDeg, TotalDeg, NSegOS, DiamMils, False);
-    end;
-  end;
+  if NSegIB >= 1 then
+    PlaceConcentricRow(Board, Layer, CXM, CYM, ROB,
+                       StartDeg, TotalDeg, NSegIB, DiamMils, True);
 end;
 
 
