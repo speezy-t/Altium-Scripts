@@ -326,6 +326,90 @@ begin
   end;
 end;
 
+// Handles placement on the smallest concentric arc (ROS = R - OuterOffMils).
+// This arc inherits its angular pitch from the inner small arc (NSegIS), but
+// at a smaller radius the chord may be shorter than DiamMils, causing overlaps.
+//
+// If no overlap: places normally (same stagger logic as the other outer arcs).
+// If overlap:
+//   - Treats the first and last staggered positions as virtual endpoints.
+//   - Re-partitions the virtual arc so chord >= DiamMils.
+//   - Places only the interior markers (virtual endpoints excluded).
+//   - Falls back to a single marker at the original arc midpoint if fewer
+//     than two interior markers would result.
+procedure PlaceSmallOuterArc(Board    : IPCB_Board;
+                              Layer    : TLayer;
+                              CXM, CYM : Double;
+                              ROS      : Double;
+                              StartDeg : Double;
+                              TotalDeg : Double;
+                              NSegIS   : Integer;
+                              DiamMils : Double);
+Var
+  PitchDeg     : Double;   // angular pitch of the inner small arc
+  ChordAtPitch : Double;   // chord between adjacent staggered positions at ROS
+  VStartDeg    : Double;   // virtual start angle (first staggered position)
+  VEndDeg      : Double;   // virtual end angle  (last  staggered position)
+  VTotalDeg    : Double;   // angular span of the virtual arc
+  VTotalRad    : Double;
+  MinAngleRad  : Double;   // minimum angular step for chord >= DiamMils at ROS
+  NewNSeg      : Integer;  // re-partitioned segment count
+  MidAngleDeg  : Double;
+  AngleDeg     : Double;
+  AngleRad     : Double;
+  CX, CY       : Double;
+  i            : Integer;
+begin
+  PitchDeg     := TotalDeg / NSegIS;
+  ChordAtPitch := 2.0 * ROS * Sin(PitchDeg * Pi / 180.0 / 2.0);
+
+  // No overlap — place using the standard stagger logic and exit.
+  if ChordAtPitch > DiamMils then
+  begin
+    PlaceConcentricRow(Board, Layer, CXM, CYM, ROS,
+                       StartDeg, TotalDeg, NSegIS, DiamMils, True);
+    Exit;
+  end;
+
+  // Overlap detected — re-partition between virtual endpoints.
+  VStartDeg := StartDeg + 0.5 * PitchDeg;
+  VEndDeg   := StartDeg + (NSegIS - 0.5) * PitchDeg;
+  VTotalDeg := VEndDeg - VStartDeg;    // = (NSegIS - 1) * PitchDeg
+  VTotalRad := VTotalDeg * Pi / 180.0;
+
+  // Largest NewNSeg such that chord at ROS over VTotalDeg/NewNSeg >= DiamMils.
+  // (>= rather than >, matching the "at least as large" requirement.)
+  MinAngleRad := 2.0 * SafeArcSin(DiamMils / (2.0 * ROS));
+  if MinAngleRad > 0.0 then
+    NewNSeg := Trunc(VTotalRad / MinAngleRad)
+  else
+    NewNSeg := 0;
+
+  // Interior marker count = NewNSeg - 1.
+  // Need >= 2 interior markers, so NewNSeg must be >= 3.
+  if NewNSeg < 3 then
+  begin
+    // Fallback: single marker at the midpoint of the original selected arc.
+    MidAngleDeg := StartDeg + TotalDeg / 2.0;
+    AngleRad    := MidAngleDeg * Pi / 180.0;
+    CX := CXM + ROS * Cos(AngleRad);
+    CY := CYM + ROS * Sin(AngleRad);
+    PlaceCircle(Board, Layer, MilsToCoord(CX), MilsToCoord(CY), DiamMils / 2.0);
+  end
+  else
+  begin
+    // Place interior markers only (i = 1 to NewNSeg - 1; skip virtual endpoints).
+    for i := 1 to NewNSeg - 1 do
+    begin
+      AngleDeg := VStartDeg + (i / NewNSeg) * VTotalDeg;
+      AngleRad := AngleDeg * Pi / 180.0;
+      CX := CXM + ROS * Cos(AngleRad);
+      CY := CYM + ROS * Sin(AngleRad);
+      PlaceCircle(Board, Layer, MilsToCoord(CX), MilsToCoord(CY), DiamMils / 2.0);
+    end;
+  end;
+end;
+
 procedure ProcessArc(Board        : IPCB_Board;
                      ArcSeg       : IPCB_Arc;
                      Layer        : TLayer;
@@ -410,8 +494,8 @@ begin
                      StartDeg, TotalDeg, NSegIB, DiamMils, True);
 
   if ROS > 0.0 then
-    PlaceConcentricRow(Board, Layer, CXM, CYM, ROS,
-                       StartDeg, TotalDeg, NSegIS, DiamMils, True);
+    PlaceSmallOuterArc(Board, Layer, CXM, CYM, ROS,
+                       StartDeg, TotalDeg, NSegIS, DiamMils);
 end;
 
 
