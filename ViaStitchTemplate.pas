@@ -271,6 +271,71 @@ end;
 //  ARC SEGMENT PROCESSING
 // ============================================================================
 
+// Returns the largest NSeg such that the chord at the given radius with angular
+// step (TotalRad / NSeg) is strictly greater than DiamMils.
+// Returns 0 if the constraint cannot be satisfied (radius too small).
+function CalcArcNSeg(TotalRad, RadiusMils, DiamMils : Double) : Integer;
+Var
+  MinAngleRad : Double;
+  N           : Integer;
+begin
+  if (RadiusMils <= 0.0) or (DiamMils >= 2.0 * RadiusMils) then
+  begin
+    Result := 0;
+    Exit;
+  end;
+  // Minimum angular step so that chord = 2·r·sin(θ/2) > DiamMils
+  MinAngleRad := 2.0 * SafeArcSin(DiamMils / (2.0 * RadiusMils));
+  N := Trunc(TotalRad / MinAngleRad);
+  while (N > 0) and (TotalRad / N <= MinAngleRad) do
+    Dec(N);
+  Result := N;
+end;
+
+// Places one concentric arc of via markers.
+//   CXM, CYM   : arc centre in mils
+//   RadiusMils : radius of this concentric arc in mils
+//   StartDeg   : start angle in degrees (Altium CCW convention)
+//   TotalDeg   : total CCW sweep in degrees
+//   NSeg       : number of equal angular segments  (NSeg+1 markers, endpoints included)
+//   Stagger    : if True, positions are offset by half-pitch (NSeg markers, no endpoints)
+procedure PlaceConcentricRow(Board      : IPCB_Board;
+                             Layer      : TLayer;
+                             CXM, CYM  : Double;
+                             RadiusMils : Double;
+                             StartDeg   : Double;
+                             TotalDeg   : Double;
+                             NSeg       : Integer;
+                             DiamMils   : Double;
+                             Stagger    : Boolean);
+Var
+  i        : Integer;
+  Count    : Integer;
+  AngleDeg : Double;
+  AngleRad : Double;
+  VX, VY   : Double;
+  CX, CY   : Double;
+begin
+  if Stagger then Count := NSeg       // outer row: NSeg markers between endpoints
+  else            Count := NSeg + 1;  // inner row: NSeg+1 markers including endpoints
+
+  for i := 0 to Count - 1 do
+  begin
+    if Stagger then
+      AngleDeg := StartDeg + ((i + 0.5) / NSeg) * TotalDeg
+    else
+      AngleDeg := StartDeg + (i        / NSeg) * TotalDeg;
+
+    AngleRad := AngleDeg * Pi / 180.0;
+    VX := Cos(AngleRad);
+    VY := Sin(AngleRad);
+
+    CX := CXM + RadiusMils * VX;
+    CY := CYM + RadiusMils * VY;
+    PlaceCircle(Board, Layer, MilsToCoord(CX), MilsToCoord(CY), DiamMils / 2.0);
+  end;
+end;
+
 procedure ProcessArc(Board        : IPCB_Board;
                      ArcSeg       : IPCB_Arc;
                      Layer        : TLayer;
@@ -278,122 +343,92 @@ procedure ProcessArc(Board        : IPCB_Board;
                      InnerOffMils : Double;
                      OuterOffMils : Double);
 Var
-  CXM, CYM          : Double;   // arc centre in mils
-  R                 : Double;   // arc radius in mils
-  StartDeg          : Double;   // start angle (degrees, Altium CCW convention)
-  TotalDeg          : Double;   // total CCW sweep in degrees
-  TotalRad          : Double;   // total CCW sweep in radians
-  RInner            : Double;   // R - InnerOffMils  (centre-side inner row)
-  MinChordAngleRad  : Double;   // smallest theta satisfying chord > DiamMils at RInner
-  NSeg              : Integer;  // number of equal angular segments
-  AngleDeg          : Double;   // current angle in degrees
-  AngleRad          : Double;   // current angle in radians
-  VX, VY            : Double;   // unit radial vector at current angle
-  CX, CY            : Double;   // marker centre in mils
-  ROuter            : Double;   // R - OuterOffMils (centre-side outer row, if positive)
-  i                 : Integer;
+  CXM, CYM   : Double;   // arc centre in mils
+  R          : Double;   // arc radius in mils
+  StartDeg   : Double;   // start angle in degrees (Altium CCW convention)
+  TotalDeg   : Double;   // total CCW sweep in degrees
+  TotalRad   : Double;   // total CCW sweep in radians
+
+  // The four concentric arc radii
+  RIS : Double;   // inner row, small side  (R - InnerOffMils)
+  RIB : Double;   // inner row, big side    (R + InnerOffMils)
+  ROS : Double;   // outer row, small side  (R - OuterOffMils)
+  ROB : Double;   // outer row, big side    (R + OuterOffMils)
+
+  // Independent segment counts for each concentric arc
+  NSegIS : Integer;
+  NSegIB : Integer;
+  NSegOS : Integer;
+  NSegOB : Integer;
 begin
   CXM      := CoordToMils(ArcSeg.XCenter);
   CYM      := CoordToMils(ArcSeg.YCenter);
   R        := CoordToMils(ArcSeg.Radius);
   StartDeg := ArcSeg.StartAngle;
 
-  // Total CCW sweep — Altium stores EndAngle > StartAngle for CCW arcs;
-  // add 360 if the difference is zero or negative (full circle edge case).
+  // Total CCW sweep; add 360 if EndAngle <= StartAngle
   TotalDeg := ArcSeg.EndAngle - StartDeg;
   if TotalDeg <= 0.0 then TotalDeg := TotalDeg + 360.0;
   TotalRad := TotalDeg * Pi / 180.0;
 
-  // -----------------------------------------------------------------
-  //  Determine theta (angular pitch) from the inner concentric arc
-  //  at radius RInner = R - InnerOffMils, which has the shortest
-  //  chord lengths and is therefore the binding constraint.
-  // -----------------------------------------------------------------
-  RInner := R - InnerOffMils;
+  // Compute the four radii
+  RIS := R - InnerOffMils;
+  RIB := R + InnerOffMils;
+  ROS := R - OuterOffMils;
+  ROB := R + OuterOffMils;
 
-  if RInner <= 0.0 then
+  // Compute independent NSeg for each concentric arc
+  NSegIS := CalcArcNSeg(TotalRad, RIS, DiamMils);
+  NSegIB := CalcArcNSeg(TotalRad, RIB, DiamMils);
+  NSegOS := CalcArcNSeg(TotalRad, ROS, DiamMils);
+  NSegOB := CalcArcNSeg(TotalRad, ROB, DiamMils);
+
+  // Validate — abort if the inner small arc (most constrained) is unworkable
+  if RIS <= 0.0 then
   begin
     ShowMessage(Format('Inner row offset (%.2f mils) equals or exceeds the arc ' +
                        'radius (%.2f mils). Cannot place inner-side markers.',
                        [InnerOffMils, R]));
     Exit;
   end;
-
-  if DiamMils >= 2.0 * RInner then
+  if NSegIS < 1 then
   begin
-    ShowMessage(Format('Via diameter (%.2f mils) is too large for the inner arc ' +
-                       'radius (%.2f mils). Chord constraint cannot be satisfied.',
-                       [DiamMils, RInner]));
+    ShowMessage(Format('Arc sweep is too small for the inner small arc (r=%.2f mils). ' +
+                       'Try a smaller via diameter or larger arc.', [RIS]));
     Exit;
   end;
-
-  // Minimum angular step: chord = 2·r·sin(θ/2) > DiamMils
-  //   => θ > 2·arcsin(DiamMils / (2·RInner))
-  MinChordAngleRad := 2.0 * SafeArcSin(DiamMils / (2.0 * RInner));
-
-  // Largest NSeg such that TotalRad / NSeg > MinChordAngleRad
-  NSeg := Trunc(TotalRad / MinChordAngleRad);
-  while (NSeg > 0) and (TotalRad / NSeg <= MinChordAngleRad) do
-    Dec(NSeg);
-
-  if NSeg < 1 then
+  if NSegIB < 1 then
   begin
-    ShowMessage('Arc sweep is too small to fit even one via segment. ' +
-                'Try a smaller via diameter or larger arc.');
+    ShowMessage(Format('Arc sweep is too small for the inner big arc (r=%.2f mils). ' +
+                       'Try a smaller via diameter or larger arc.', [RIB]));
     Exit;
   end;
 
   // ------------------------------------------------------------------
-  //  Inner row  —  NSeg + 1 markers per concentric arc
-  //    Outer concentric arc : R + InnerOffMils
-  //    Inner concentric arc : R - InnerOffMils  (= RInner)
+  //  Inner row — endpoints included (Stagger = False)
   // ------------------------------------------------------------------
-  for i := 0 to NSeg do
-  begin
-    AngleDeg := StartDeg + (i / NSeg) * TotalDeg;
-    AngleRad := AngleDeg * Pi / 180.0;
-    VX := Cos(AngleRad);
-    VY := Sin(AngleRad);
+  // Small side (R - InnerOffMils)
+  PlaceConcentricRow(Board, Layer, CXM, CYM, RIS,
+                     StartDeg, TotalDeg, NSegIS, DiamMils, False);
 
-    // Outer concentric arc (away from arc centre)
-    CX := CXM + (R + InnerOffMils) * VX;
-    CY := CYM + (R + InnerOffMils) * VY;
-    PlaceCircle(Board, Layer, MilsToCoord(CX), MilsToCoord(CY), DiamMils / 2.0);
-
-    // Inner concentric arc (toward arc centre)
-    CX := CXM + RInner * VX;
-    CY := CYM + RInner * VY;
-    PlaceCircle(Board, Layer, MilsToCoord(CX), MilsToCoord(CY), DiamMils / 2.0);
-  end;
+  // Big side (R + InnerOffMils)
+  PlaceConcentricRow(Board, Layer, CXM, CYM, RIB,
+                     StartDeg, TotalDeg, NSegIB, DiamMils, False);
 
   // ------------------------------------------------------------------
-  //  Outer row  —  NSeg markers per concentric arc, staggered by θ/2
-  //    Outer concentric arc : R + OuterOffMils
-  //    Inner concentric arc : R - OuterOffMils  (placed only if > 0)
+  //  Outer row — staggered by half-pitch (Stagger = True)
+  //  Each side uses its own NSeg; silently skipped if radius <= 0
+  //  or if the chord constraint cannot be satisfied.
   // ------------------------------------------------------------------
-  for i := 0 to NSeg - 1 do
-  begin
-    AngleDeg := StartDeg + ((i + 0.5) / NSeg) * TotalDeg;
-    AngleRad := AngleDeg * Pi / 180.0;
-    VX := Cos(AngleRad);
-    VY := Sin(AngleRad);
+  // Big side (R + OuterOffMils) — always valid
+  if NSegOB >= 1 then
+    PlaceConcentricRow(Board, Layer, CXM, CYM, ROB,
+                       StartDeg, TotalDeg, NSegOB, DiamMils, True);
 
-    // Outer concentric arc
-    CX := CXM + (R + OuterOffMils) * VX;
-    CY := CYM + (R + OuterOffMils) * VY;
-    PlaceCircle(Board, Layer, MilsToCoord(CX), MilsToCoord(CY), DiamMils / 2.0);
-
-    // Inner concentric arc — omit if the offset exceeds the arc radius.
-    // (This is the corner case noted during design; a separate check will
-    //  be added once the overall logic is validated.)
-    ROuter := R - OuterOffMils;
-    if ROuter > 0.0 then
-    begin
-      CX := CXM + ROuter * VX;
-      CY := CYM + ROuter * VY;
-      PlaceCircle(Board, Layer, MilsToCoord(CX), MilsToCoord(CY), DiamMils / 2.0);
-    end;
-  end;
+  // Small side (R - OuterOffMils) — only if radius is positive and workable
+  if (ROS > 0.0) and (NSegOS >= 1) then
+    PlaceConcentricRow(Board, Layer, CXM, CYM, ROS,
+                       StartDeg, TotalDeg, NSegOS, DiamMils, True);
 end;
 
 
