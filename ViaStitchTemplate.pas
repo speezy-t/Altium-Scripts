@@ -121,42 +121,27 @@ function EnsureViaStitchLayer(Board : IPCB_Board) : TLayer;
 Const
   kLayerName = 'Via Stitch Placement';
 Var
-  Target   : TLayer;
-  LS       : IPCB_LayerStack;
-  LO       : IPCB_LayerObject;
-  Found    : Boolean;
+  Target      : TLayer;
+  CurrentName : String;
 begin
-  Target := LayerUtils.MechanicalLayer(100);
-  Found  := False;
-  LS     := Board.LayerStack;
+  Target      := LayerUtils.MechanicalLayer(100);
+  CurrentName := Board.LayerName[Target];
 
-  // Iterate the live layer stack — works correctly in Altium 19+ / 26.x
-  LO := LS.FirstLayer;
-  while Assigned(LO) do
+  if CurrentName = kLayerName then
   begin
-    if LO.LayerID = Target then
-    begin
-      Found := True;
-      // Silently correct the name if it differs
-      if LO.Name <> kLayerName then
-        LO.Name := kLayerName;
-      Break;
-    end;
-    LO := LS.NextLayer(LO);
-  end;
-
-  if not Found then
+    // Layer exists and is already named correctly — nothing to do.
+  end
+  else if CurrentName = '' then
   begin
-    // Layer does not exist — add it
-    LO := LS.AddNewMechanicalLayer;
-    if Assigned(LO) then
-    begin
-      LO.Name := kLayerName;
-      Target  := LO.LayerID;   // use the ID assigned by Altium
-    end
-    else
-      ShowMessage('Could not create "' + kLayerName + '" automatically. ' +
-                  'Please add it manually in the Layer Stack Manager, then re-run.');
+    // Layer exists in the board but has no name yet — name it now.
+    Board.LayerName[Target] := kLayerName;
+  end
+  else
+  begin
+    // Layer exists but carries a different name — rename it silently.
+    // Remove this branch and add a ShowMessage if you prefer to preserve
+    // an existing custom name.
+    Board.LayerName[Target] := kLayerName;
   end;
 
   Result := Target;
