@@ -83,6 +83,7 @@ var
   SMCount  : Integer;
   FirstSM  : TLayer;
   LastSM   : TLayer;
+  Name     : String;
 begin
   Result  := -1;
   SMCount := 0;
@@ -95,14 +96,23 @@ begin
   for i := 0 to Stack.Count - 1 do
   begin
     Layer := Stack.LayerObject_V7[i];
-    if (Layer <> Nil) and (Layer.LayerClass = eLayerClass_SolderMask) then
+    if Layer <> Nil then
     begin
-      Inc(SMCount);
-      if SMCount = 1 then FirstSM := Layer.LayerID;
-      LastSM := Layer.LayerID;   { keep updating; ends on the final SM layer }
+      { Board.LayerName() is used elsewhere in this script and is known to
+        compile. Matching on 'solder mask' case-insensitively covers both
+        the default names "Top Solder Mask" and "Bottom Solder Mask" as well
+        as any minor naming variations Altium may use internally. }
+      Name := LowerCase(Board.LayerName(Layer.LayerID));
+      if Pos('solder mask', Name) > 0 then
+      begin
+        Inc(SMCount);
+        if SMCount = 1 then FirstSM := Layer.LayerID;
+        LastSM := Layer.LayerID;   { ends on the last SM layer found }
+      end;
     end;
   end;
 
+  { Stack is ordered top-to-bottom, so FirstSM = Top, LastSM = Bottom }
   if IsTop then
     Result := FirstSM
   else
