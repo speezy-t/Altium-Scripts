@@ -9,8 +9,8 @@
 
   Because Altium renders track/arc solder-mask expansions with rounded
   end-caps, this script instead draws an explicit rectangular region on
-  the corresponding solder-mask layer so that the opening meets pad edges
-  cleanly without overlapping them.
+  the corresponding solder-mask layer (eTopSolder / eBottomSolder) so
+  that the opening meets pad edges cleanly without overlapping them.
 
   PRE-CONDITIONS
   --------------
@@ -58,75 +58,12 @@
 
 
 { ---------------------------------------------------------------------------
-  ResolveSolderMaskLayer
-  ---------------------------------------------------------------------------
-  In Altium 26 the legacy layer-constant identifiers eTopSolderMask and
-  eBottomSolderMask are no longer declared in the scripting environment.
-  Solder-mask layers must instead be resolved at run-time by walking the
-  board's V7 layer stack and checking each layer's LayerClass.
-
-  In a standard stackup the layers are ordered top-to-bottom, so the FIRST
-  solder-mask layer encountered is always the Top Solder Mask and the LAST
-  is the Bottom Solder Mask.
-
-  IsTop = True  → returns Top Solder Mask layer ID
-  IsTop = False → returns Bottom Solder Mask layer ID
-
-  Returns -1 if no qualifying layer can be found (caller must check).
-  --------------------------------------------------------------------------- }
-function ResolveSolderMaskLayer(Board : IPCB_Board;
-                                IsTop : Boolean) : TLayer;
-var
-  Stack    : IPCB_LayerStack_V7;
-  Layer    : IPCB_LayerObject_V7;
-  i        : Integer;
-  SMCount  : Integer;
-  FirstSM  : TLayer;
-  LastSM   : TLayer;
-  Name     : String;
-begin
-  Result  := -1;
-  SMCount := 0;
-  FirstSM := -1;
-  LastSM  := -1;
-
-  Stack := Board.LayerStack_V7;
-  if Stack = Nil then Exit;
-
-  for i := 0 to Stack.Count - 1 do
-  begin
-    Layer := Stack.LayerObject_V7[i];
-    if Layer <> Nil then
-    begin
-      { Board.LayerName() is used elsewhere in this script and is known to
-        compile. Matching on 'solder mask' case-insensitively covers both
-        the default names "Top Solder Mask" and "Bottom Solder Mask" as well
-        as any minor naming variations Altium may use internally. }
-      Name := LowerCase(Board.LayerName(Layer.LayerID));
-      if Pos('solder mask', Name) > 0 then
-      begin
-        Inc(SMCount);
-        if SMCount = 1 then FirstSM := Layer.LayerID;
-        LastSM := Layer.LayerID;   { ends on the last SM layer found }
-      end;
-    end;
-  end;
-
-  { Stack is ordered top-to-bottom, so FirstSM = Top, LastSM = Bottom }
-  if IsTop then
-    Result := FirstSM
-  else
-    Result := LastSM;
-end;
-
-
-{ ---------------------------------------------------------------------------
   GetSelectedTrack
   Searches the board for selected tracks on the Top or Bottom copper layer.
   Returns TRUE and sets Track if exactly one qualifying track is found.
   Displays an appropriate error dialog and returns FALSE otherwise.
   --------------------------------------------------------------------------- }
-function GetSelectedTrack(Board    : IPCB_Board;
+function GetSelectedTrack(Board     : IPCB_Board;
                           var Track : IPCB_Track) : Boolean;
 var
   Iter     : IPCB_BoardIterator;
@@ -186,9 +123,13 @@ end;
   Sets Cancelled := True if the user closes/cancels without clicking OK.
   All returned values are in mils (floating-point).
 
+  NOTE on parsing: Altium's DelphiScript does not expose the standard Pascal
+  Val() procedure. StrToFloatDef(str, fallback) is used instead — it returns
+  the fallback (-1) when the string cannot be parsed, which then fails the
+  >= 0 validation check and re-prompts the user.
+
   NOTE on Font.Style: DelphiScript does not support bare empty-set literals
-  ([]) as an r-value.  The correct syntax is TFontStyles([]), but since the
-  label style is cosmetic the property is simply left at its default here.
+  ([]) as an r-value assignment, so that property is left at its default.
   --------------------------------------------------------------------------- }
 procedure ShowParamDialog(var Expansion   : Double;
                           var LeftOffset  : Double;
@@ -205,7 +146,6 @@ var
   EdtRight     : TEdit;
   BtnOK        : TButton;
   BtnCancel    : TButton;
-  Code         : Integer;
   ParsedVal    : Double;
   ValidationOK : Boolean;
 begin
@@ -267,7 +207,7 @@ begin
     EdtRight.Width  := 110;
     EdtRight.Text   := '0';
 
-    { Helper note (Font.Style intentionally not set – see procedure note above) }
+    { Helper note }
     LblNote         := TLabel.Create(Dlg);
     LblNote.Parent  := Dlg;
     LblNote.Caption := '"Left" = endpoint with more-negative X coordinate.';
@@ -304,8 +244,11 @@ begin
 
       ValidationOK := True;
 
-      Val(EdtExp.Text, ParsedVal, Code);
-      if (Code <> 0) or (ParsedVal < 0) then
+      { StrToFloatDef returns -1 on a parse failure, which then fails the
+        >= 0 check below and re-prompts the user with a clear message. }
+
+      ParsedVal := StrToFloatDef(EdtExp.Text, -1);
+      if ParsedVal < 0 then
       begin
         ShowMessage('Expansion must be a non-negative number (e.g. 25 or 25.4).');
         ValidationOK := False;
@@ -313,8 +256,8 @@ begin
       end;
       Expansion := ParsedVal;
 
-      Val(EdtLeft.Text, ParsedVal, Code);
-      if (Code <> 0) or (ParsedVal < 0) then
+      ParsedVal := StrToFloatDef(EdtLeft.Text, -1);
+      if ParsedVal < 0 then
       begin
         ShowMessage('Left offset must be a non-negative number.');
         ValidationOK := False;
@@ -322,8 +265,8 @@ begin
       end;
       LeftOffset := ParsedVal;
 
-      Val(EdtRight.Text, ParsedVal, Code);
-      if (Code <> 0) or (ParsedVal < 0) then
+      ParsedVal := StrToFloatDef(EdtRight.Text, -1);
+      if ParsedVal < 0 then
       begin
         ShowMessage('Right offset must be a non-negative number.');
         ValidationOK := False;
@@ -502,20 +445,11 @@ begin
   if not GetSelectedTrack(Board, Track) then
     Exit;
 
-  { 3. Resolve the target solder-mask layer via the V7 layer stack }
+  { 3. Resolve the target solder-mask layer }
   if Track.Layer = eTopLayer then
-    TargetLayer := ResolveSolderMaskLayer(Board, True)
+    TargetLayer := eTopSolder
   else
-    TargetLayer := ResolveSolderMaskLayer(Board, False);
-
-  if TargetLayer = -1 then
-  begin
-    ShowMessage(
-      'Error: Could not locate the solder mask layer for this board.' + #13#10 +
-      'Verify that your layer stack contains a Top/Bottom Solder Mask layer.'
-    );
-    Exit;
-  end;
+    TargetLayer := eBottomSolder;
 
   { 4. Collect parameters from the user }
   ShowParamDialog(Expansion, LeftOffset, RightOffset, Cancelled);
