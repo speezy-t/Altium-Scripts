@@ -7,17 +7,34 @@
   Places a filled solder-mask opening region aligned to a selected copper
   track or arc on the Top or Bottom signal layer.
 
+  REGION CREATION STRATEGY
+  ------------------------
+  Regions are created directly via the PCB object factory and populated by
+  calling AddPoint on the region's MainContour property.  No helper
+  primitives or RunProcess conversion are used.
+
   TRACK CASE
   ----------
-  A rotated rectangle is drawn as four helper track segments, converted to
-  a region via Tools → Convert → Create Region from Selected Primitives,
-  and the helpers are then deleted.
+  The region outline is a rotated rectangle defined by four corner points
+  computed from the track geometry (width, expansion, left/right offsets).
 
   ARC CASE
   --------
-  Two concentric helper arcs plus two closing helper tracks form the region
-  boundary.  After conversion the helpers are deleted and the region's
-  Arc Approximation is set to 0.001 mil for smooth rendering.
+  The region outline is a polygon that approximates the arc-bounded shape.
+  Points are computed at 1-degree intervals along both the outer arc
+  (radius = CopperRadius + halfWidth + Expansion) and inner arc
+  (radius = CopperRadius - halfWidth - Expansion), then connected at the
+  start and end angles to form a closed loop.  At 1-degree resolution the
+  result is visually indistinguishable from a perfect arc.
+
+  NOTE ON PROPERTY NAME
+  ---------------------
+  If "undeclared identifier: MainContour" is reported, the contour property
+  has a different name in your build.  Candidates to try in order:
+    Region.Outline         (pre-v20 name — was undeclared in our testing)
+    Region.MainContour     (current attempt)
+    Region.GeometricPolygon
+  Replace every occurrence of .MainContour below with the next candidate.
 
   PRE-CONDITIONS
   --------------
@@ -37,71 +54,7 @@
     "Left"  = more-negative Y endpoint (bottom in Altium's upward-Y system)
     "Right" = more-positive Y endpoint (top)
 
-  UNDO
-  ----
-  Helper creation, helper deletion, and arc-approximation edits each occupy
-  their own PreProcess/PostProcess transaction.  The region conversion uses
-  RunProcess which manages its own transaction.  All steps can be undone
-  individually with Ctrl+Z.
-
   =========================================================================== }
-
-
-{ ---------------------------------------------------------------------------
-  MakeHelperTrack
-  --------------------------------------------------------------------------- }
-function MakeHelperTrack(Board       : IPCB_Board;
-                         TargetLayer : TLayer;
-                         X1, Y1      : TCoord;
-                         X2, Y2      : TCoord;
-                         LineWidth   : TCoord) : IPCB_Track;
-var
-  T : IPCB_Track;
-begin
-  T         := PCBServer.PCBObjectFactory(eTrackObject, eNoDimension, eCreate_Default);
-  T.X1      := X1;
-  T.Y1      := Y1;
-  T.X2      := X2;
-  T.Y2      := Y2;
-  T.Layer   := TargetLayer;
-  T.Width   := LineWidth;
-
-  Board.AddPCBObject(T);
-  PCBServer.SendMessageToRobots(
-    Board.I_ObjectAddress, c_Broadcast, PCBM_BoardRegisteration, T.I_ObjectAddress);
-
-  Result := T;
-end;
-
-
-{ ---------------------------------------------------------------------------
-  MakeHelperArc
-  --------------------------------------------------------------------------- }
-function MakeHelperArc(Board         : IPCB_Board;
-                       TargetLayer   : TLayer;
-                       CX, CY        : TCoord;
-                       ArcRadius     : TCoord;
-                       StartAngleDeg : Double;
-                       EndAngleDeg   : Double;
-                       LineWidth     : TCoord) : IPCB_Arc;
-var
-  A : IPCB_Arc;
-begin
-  A            := PCBServer.PCBObjectFactory(eArcObject, eNoDimension, eCreate_Default);
-  A.XCenter    := CX;
-  A.YCenter    := CY;
-  A.Radius     := ArcRadius;
-  A.StartAngle := StartAngleDeg;
-  A.EndAngle   := EndAngleDeg;
-  A.Layer      := TargetLayer;
-  A.LineWidth  := LineWidth;
-
-  Board.AddPCBObject(A);
-  PCBServer.SendMessageToRobots(
-    Board.I_ObjectAddress, c_Broadcast, PCBM_BoardRegisteration, A.I_ObjectAddress);
-
-  Result := A;
-end;
 
 
 { ---------------------------------------------------------------------------
@@ -170,7 +123,6 @@ begin
   end;
 
   if (Track <> Nil) and (Arc <> Nil) then Arc := Nil;
-
   Result := True;
 end;
 
@@ -312,67 +264,164 @@ end;
 
 
 { ---------------------------------------------------------------------------
-  FindNewRegion
-  After RunProcess('PCB:CreateRegionFromSelectedPrimitives'), Altium leaves
-  the newly created region selected.  This function scans for a selected
-  region on TargetLayer and returns it (or Nil if none found).
+  PlaceTrackRegion
+  Creates a rectangular region directly on TargetLayer using the four
+  pre-computed corner coordinates (in mils).  All geometry is converted to
+  TCoord at the point of the AddPoint call.
+
+  The region outline is populated via Region.MainContour.AddPoint.
+  If "undeclared identifier: MainContour" is reported, replace every
+  occurrence of .MainContour with the correct property name for your build
+  (see the NOTE ON PROPERTY NAME in the file header).
   --------------------------------------------------------------------------- }
-function FindNewRegion(Board       : IPCB_Board;
-                       TargetLayer : TLayer) : IPCB_Region;
+procedure PlaceTrackRegion(Board       : IPCB_Board;
+                           TargetLayer : TLayer;
+                           ax, ay      : Double;
+                           bx, by      : Double;
+                           cx, cy      : Double;
+                           dx, dy      : Double);
 var
-  Iter : IPCB_BoardIterator;
-  Obj  : IPCB_Primitive;
+  Region : IPCB_Region;
 begin
-  Result := Nil;
-
-  Iter := Board.BoardIterator_Create;
-  Iter.AddFilter_ObjectSet(MkSet(eRegionObject));
-  Iter.AddFilter_LayerSet(AllLayers);
-
-  Obj := Iter.FirstPCBObject;
-  while Obj <> Nil do
+  Region := PCBServer.PCBObjectFactory(eRegionObject, eNoDimension, eCreate_Default);
+  if Region = Nil then
   begin
-    if Obj.Selected and (Obj.Layer = TargetLayer) then
-    begin
-      Result := Obj;
-      Break;
-    end;
-    Obj := Iter.NextPCBObject;
+    ShowMessage('Error: Could not create Region object.');
+    Exit;
   end;
 
-  Board.BoardIterator_Destroy(Iter);
+  Region.Layer := TargetLayer;
+
+  Region.MainContour.AddPoint(MilsToCoord(ax), MilsToCoord(ay));
+  Region.MainContour.AddPoint(MilsToCoord(bx), MilsToCoord(by));
+  Region.MainContour.AddPoint(MilsToCoord(cx), MilsToCoord(cy));
+  Region.MainContour.AddPoint(MilsToCoord(dx), MilsToCoord(dy));
+
+  Board.AddPCBObject(Region);
+  PCBServer.SendMessageToRobots(
+    Board.I_ObjectAddress, c_Broadcast, PCBM_BoardRegisteration, Region.I_ObjectAddress);
 end;
 
 
 { ---------------------------------------------------------------------------
-  DrawTrackHelpers
-  Full flow for the track case:
-    1. Compute rotated rectangle corners.
-    2. Place four helper track segments in a PreProcess/PostProcess block.
-    3. Deselect all, select only the four helpers, refresh.
-    4. RunProcess to convert to a region  (OUTSIDE any Pre/PostProcess block).
-    5. Delete the four helpers in a PreProcess/PostProcess block.
+  PlaceArcRegion
+  Creates a region directly on TargetLayer whose outline approximates the
+  arc-bounded shape using a polygon at 1-degree resolution.
+
+  The polygon is built as follows (viewed from outside the arc):
+    - Outer arc: points from StartAngle to EndAngle at OuterRadius
+    - Inner arc: points from EndAngle back to StartAngle at InnerRadius
+  These two sequences share their first and last points, so the polygon
+  closes naturally.
+
+  SWEEP ANGLE
+  -----------
+  Altium arcs run counterclockwise from StartAngle to EndAngle.
+  If EndAngle <= StartAngle the arc wraps through 0° and the actual
+  counterclockwise sweep = EndAngle - StartAngle + 360.
   --------------------------------------------------------------------------- }
-procedure DrawTrackHelpers(Board       : IPCB_Board;
-                           Track       : IPCB_Track;
-                           TargetLayer : TLayer;
-                           Expansion   : Double;
-                           LeftOffset  : Double;
-                           RightOffset : Double);
+procedure PlaceArcRegion(Board          : IPCB_Board;
+                         Arc            : IPCB_Arc;
+                         TargetLayer    : TLayer;
+                         ExpansionCoord : TCoord);
 var
-  Lx, Ly, Rx, Ry : Double;
-  dX, dY         : Double;
-  TrackAngle     : Double;
-  ux, uy, vx, vy : Double;
-  Half, Lo, Ro   : Double;
-  ax, ay         : Double;
-  bx, by         : Double;
-  cx, cy         : Double;
-  dx, dy         : Double;
-  LineW          : TCoord;
-  T1, T2, T3, T4 : IPCB_Track;
+  HalfWidth    : TCoord;
+  OuterRadius  : TCoord;
+  InnerRadius  : TCoord;
+  SweepDeg     : Double;
+  NumSteps     : Integer;
+  StepDeg      : Double;
+  AngleDeg     : Double;
+  AngleRad     : Double;
+  px, py       : TCoord;
+  i            : Integer;
+  Region       : IPCB_Region;
 begin
-  { Assign left/right endpoints (mils) }
+  HalfWidth   := Arc.LineWidth div 2;
+  OuterRadius := Arc.Radius + HalfWidth + ExpansionCoord;
+  InnerRadius := Arc.Radius - HalfWidth - ExpansionCoord;
+
+  if InnerRadius <= 0 then
+  begin
+    ShowMessage(
+      'Warning: Expansion value is too large — inner arc radius would be' + #13#10 +
+      'zero or negative.  Please use a smaller expansion.');
+    Exit;
+  end;
+
+  { Compute the counterclockwise sweep in degrees }
+  SweepDeg := Arc.EndAngle - Arc.StartAngle;
+  if SweepDeg <= 0 then SweepDeg := SweepDeg + 360;
+
+  { One step per degree; minimum of 4 steps for very short arcs }
+  NumSteps := Round(SweepDeg);
+  if NumSteps < 4 then NumSteps := 4;
+  StepDeg := SweepDeg / NumSteps;
+
+  Region := PCBServer.PCBObjectFactory(eRegionObject, eNoDimension, eCreate_Default);
+  if Region = Nil then
+  begin
+    ShowMessage('Error: Could not create Region object.');
+    Exit;
+  end;
+
+  Region.Layer := TargetLayer;
+
+  { Outer arc: StartAngle → EndAngle (counterclockwise) }
+  for i := 0 to NumSteps do
+  begin
+    AngleDeg := Arc.StartAngle + i * StepDeg;
+    AngleRad := AngleDeg * Pi / 180.0;
+    px := Round(Arc.XCenter + OuterRadius * Cos(AngleRad));
+    py := Round(Arc.YCenter + OuterRadius * Sin(AngleRad));
+    Region.MainContour.AddPoint(px, py);
+  end;
+
+  { Inner arc: EndAngle → StartAngle (clockwise — reverse iteration) }
+  for i := NumSteps downto 0 do
+  begin
+    AngleDeg := Arc.StartAngle + i * StepDeg;
+    AngleRad := AngleDeg * Pi / 180.0;
+    px := Round(Arc.XCenter + InnerRadius * Cos(AngleRad));
+    py := Round(Arc.YCenter + InnerRadius * Sin(AngleRad));
+    Region.MainContour.AddPoint(px, py);
+  end;
+
+  Board.AddPCBObject(Region);
+  PCBServer.SendMessageToRobots(
+    Board.I_ObjectAddress, c_Broadcast, PCBM_BoardRegisteration, Region.I_ObjectAddress);
+end;
+
+
+{ ---------------------------------------------------------------------------
+  DrawTrackRegion
+  Computes the rotated rectangle corners for a track and calls PlaceTrackRegion.
+  All geometry is done in mils (Double); TCoord conversion happens inside
+  PlaceTrackRegion at the AddPoint call.
+
+  deltaX / deltaY name the along-track direction vector components.
+  These are distinct from the corner variables ax/ay … dx/dy even in
+  DelphiScript's case-insensitive environment because "deltaX" ≠ "dx".
+  --------------------------------------------------------------------------- }
+procedure DrawTrackRegion(Board       : IPCB_Board;
+                          Track       : IPCB_Track;
+                          TargetLayer : TLayer;
+                          Expansion   : Double;
+                          LeftOffset  : Double;
+                          RightOffset : Double);
+var
+  Lx, Ly, Rx, Ry  : Double;
+  deltaX, deltaY  : Double;
+  TrackAngle      : Double;
+  ux, uy, vx, vy : Double;
+  Half, Lo, Ro    : Double;
+  ax, ay          : Double;
+  bx, by          : Double;
+  cx, cy          : Double;
+  dx, dy          : Double;
+begin
+  { Assign left/right endpoints (mils).
+    Left = more-negative X; tiebreaker for vertical tracks: lower Y = left. }
   if (Track.X1 < Track.X2) or
      ((Track.X1 = Track.X2) and (Track.Y1 < Track.Y2)) then
   begin
@@ -385,16 +434,16 @@ begin
     Rx := CoordToMils(Track.X1);  Ry := CoordToMils(Track.Y1);
   end;
 
-  dX := Rx - Lx;
-  dY := Ry - Ly;
+  deltaX := Rx - Lx;
+  deltaY := Ry - Ly;
 
-  if (Abs(dX) < 0.001) and (Abs(dY) < 0.001) then
+  if (Abs(deltaX) < 0.001) and (Abs(deltaY) < 0.001) then
   begin
     ShowMessage('Warning: The selected track has zero (or near-zero) length. Skipped.');
     Exit;
   end;
 
-  TrackAngle := ArcTan2(dY, dX);
+  TrackAngle := ArcTan2(deltaY, deltaX);
   ux :=  Cos(TrackAngle);
   uy :=  Sin(TrackAngle);
   vx :=  Cos(TrackAngle + Pi / 2);
@@ -409,161 +458,24 @@ begin
   cx := Rx - Ro * ux - Half * vx;  cy := Ry - Ro * uy - Half * vy;
   dx := Lx + Lo * ux - Half * vx;  dy := Ly + Lo * uy - Half * vy;
 
-  LineW := MilsToCoord(1);
-
-  { --- Step 1: create helper tracks --- }
   PCBServer.PreProcess;
-  T1 := MakeHelperTrack(Board, TargetLayer,
-          MilsToCoord(ax), MilsToCoord(ay), MilsToCoord(bx), MilsToCoord(by), LineW);
-  T2 := MakeHelperTrack(Board, TargetLayer,
-          MilsToCoord(bx), MilsToCoord(by), MilsToCoord(cx), MilsToCoord(cy), LineW);
-  T3 := MakeHelperTrack(Board, TargetLayer,
-          MilsToCoord(cx), MilsToCoord(cy), MilsToCoord(dx), MilsToCoord(dy), LineW);
-  T4 := MakeHelperTrack(Board, TargetLayer,
-          MilsToCoord(dx), MilsToCoord(dy), MilsToCoord(ax), MilsToCoord(ay), LineW);
+  PlaceTrackRegion(Board, TargetLayer, ax, ay, bx, by, cx, cy, dx, dy);
   PCBServer.PostProcess;
-  Board.ViewManager_FullUpdate;
-
-  { --- Step 2: select only the four helpers --- }
-  ResetParameters;
-  RunProcess('PCB:DeselAll');
-  T1.Selected := True;
-  T2.Selected := True;
-  T3.Selected := True;
-  T4.Selected := True;
-  Board.ViewManager_FullUpdate;
-
-  { --- Step 3: convert to region (RunProcess manages its own transaction) --- }
-  ResetParameters;
-  RunProcess('PCB:CreateRegionFromSelectedPrimitives');
-  Board.ViewManager_FullUpdate;
-
-  { --- Step 4: delete helper tracks --- }
-  PCBServer.PreProcess;
-  Board.RemovePCBObject(T1);
-  Board.RemovePCBObject(T2);
-  Board.RemovePCBObject(T3);
-  Board.RemovePCBObject(T4);
-  PCBServer.PostProcess;
-  Board.ViewManager_FullUpdate;
 end;
 
 
 { ---------------------------------------------------------------------------
-  DrawArcHelpers
-  Full flow for the arc case:
-    1. Place two concentric helper arcs and two closing helper tracks in a
-       PreProcess/PostProcess block.
-    2. Deselect all, select only the four helpers, refresh.
-    3. RunProcess to convert to a region  (OUTSIDE any Pre/PostProcess block).
-    4. Find the newly created region (it will be selected after RunProcess).
-    5. Set ArcApproximation = 0.001 mil on the region.
-    6. Delete the four helpers in a PreProcess/PostProcess block.
+  DrawArcRegion
+  Calls PlaceArcRegion inside a PreProcess/PostProcess transaction.
   --------------------------------------------------------------------------- }
-procedure DrawArcHelpers(Board          : IPCB_Board;
-                         Arc            : IPCB_Arc;
-                         TargetLayer    : TLayer;
-                         ExpansionCoord : TCoord);
-var
-  HalfWidth        : TCoord;
-  OuterRadius      : TCoord;
-  InnerRadius      : TCoord;
-  StartRad         : Double;
-  EndRad           : Double;
-  OStartX, OStartY : TCoord;
-  OEndX,   OEndY   : TCoord;
-  IStartX, IStartY : TCoord;
-  IEndX,   IEndY   : TCoord;
-  OuterArcHelper   : IPCB_Arc;
-  InnerArcHelper   : IPCB_Arc;
-  StartLine        : IPCB_Track;
-  EndLine          : IPCB_Track;
-  NewRegion        : IPCB_Region;
+procedure DrawArcRegion(Board          : IPCB_Board;
+                        Arc            : IPCB_Arc;
+                        TargetLayer    : TLayer;
+                        ExpansionCoord : TCoord);
 begin
-  HalfWidth   := Arc.LineWidth div 2;
-  OuterRadius := Arc.Radius + HalfWidth + ExpansionCoord;
-  InnerRadius := Arc.Radius - HalfWidth - ExpansionCoord;
-
-  if InnerRadius <= 0 then
-  begin
-    ShowMessage(
-      'Warning: Expansion value is too large — the inner arc radius would be' + #13#10 +
-      'zero or negative.  Please use a smaller expansion.');
-    Exit;
-  end;
-
-  StartRad := Arc.StartAngle * Pi / 180.0;
-  EndRad   := Arc.EndAngle   * Pi / 180.0;
-
-  OStartX := Round(Arc.XCenter + OuterRadius * Cos(StartRad));
-  OStartY := Round(Arc.YCenter + OuterRadius * Sin(StartRad));
-  OEndX   := Round(Arc.XCenter + OuterRadius * Cos(EndRad));
-  OEndY   := Round(Arc.YCenter + OuterRadius * Sin(EndRad));
-
-  IStartX := Round(Arc.XCenter + InnerRadius * Cos(StartRad));
-  IStartY := Round(Arc.YCenter + InnerRadius * Sin(StartRad));
-  IEndX   := Round(Arc.XCenter + InnerRadius * Cos(EndRad));
-  IEndY   := Round(Arc.YCenter + InnerRadius * Sin(EndRad));
-
-  { --- Step 1: create helper primitives --- }
   PCBServer.PreProcess;
-  OuterArcHelper := MakeHelperArc(Board, TargetLayer,
-                      Arc.XCenter, Arc.YCenter, OuterRadius,
-                      Arc.StartAngle, Arc.EndAngle, MilsToCoord(0.5));
-  InnerArcHelper := MakeHelperArc(Board, TargetLayer,
-                      Arc.XCenter, Arc.YCenter, InnerRadius,
-                      Arc.StartAngle, Arc.EndAngle, MilsToCoord(0.5));
-  StartLine := MakeHelperTrack(Board, TargetLayer,
-                 OStartX, OStartY, IStartX, IStartY, MilsToCoord(1));
-  EndLine   := MakeHelperTrack(Board, TargetLayer,
-                 OEndX,   OEndY,   IEndX,   IEndY,   MilsToCoord(1));
+  PlaceArcRegion(Board, Arc, TargetLayer, ExpansionCoord);
   PCBServer.PostProcess;
-  Board.ViewManager_FullUpdate;
-
-  { --- Step 2: select only the four helpers --- }
-  ResetParameters;
-  RunProcess('PCB:DeselAll');
-  OuterArcHelper.Selected := True;
-  InnerArcHelper.Selected := True;
-  StartLine.Selected      := True;
-  EndLine.Selected        := True;
-  Board.ViewManager_FullUpdate;
-
-  { --- Step 3: convert to region (RunProcess manages its own transaction) --- }
-  ResetParameters;
-  RunProcess('PCB:CreateRegionFromSelectedPrimitives');
-  Board.ViewManager_FullUpdate;
-
-  { --- Step 4: find the new region (left selected by RunProcess) --- }
-  NewRegion := FindNewRegion(Board, TargetLayer);
-
-  if NewRegion = Nil then
-    ShowMessage(
-      'Warning: Region conversion may have failed — no new region was found' + #13#10 +
-      'on the solder mask layer.  The helper primitives have been left in' + #13#10 +
-      'place so you can inspect the state of the board.')
-  else
-  begin
-    { --- Step 5: set Arc Approximation to 0.001 mil for smooth rendering --- }
-    PCBServer.PreProcess;
-    NewRegion.ArcApproximation := MilsToCoord(0.001);
-    PCBServer.SendMessageToRobots(
-      Board.I_ObjectAddress, c_Broadcast,
-      PCBM_BoardRegisteration, NewRegion.I_ObjectAddress);
-    PCBServer.PostProcess;
-  end;
-
-  { --- Step 6: delete helpers (only if conversion succeeded) --- }
-  if NewRegion <> Nil then
-  begin
-    PCBServer.PreProcess;
-    Board.RemovePCBObject(OuterArcHelper);
-    Board.RemovePCBObject(InnerArcHelper);
-    Board.RemovePCBObject(StartLine);
-    Board.RemovePCBObject(EndLine);
-    PCBServer.PostProcess;
-    Board.ViewManager_FullUpdate;
-  end;
 end;
 
 
@@ -582,7 +494,6 @@ var
   RightOffset : Double;
   Cancelled   : Boolean;
 begin
-  { 1. Obtain active PCB document }
   Board := PCBServer.GetCurrentPCBBoard;
   if Board = Nil then
   begin
@@ -591,29 +502,24 @@ begin
     Exit;
   end;
 
-  { 2. Locate and validate the selected track or arc }
   Track := Nil;
   Arc   := Nil;
   if not GetSelectedObject(Board, Track, Arc) then Exit;
 
-  { 3. Resolve source and target layers }
   if Track <> Nil then SourceLayer := Track.Layer
   else               SourceLayer := Arc.Layer;
 
   if SourceLayer = eTopLayer then TargetLayer := eTopSolder
   else                            TargetLayer := eBottomSolder;
 
-  { 4. Collect parameters from the user }
   ShowParamDialog(Expansion, LeftOffset, RightOffset, Cancelled);
   if Cancelled then Exit;
 
-  { 5. Run the appropriate flow }
   if Track <> Nil then
-    DrawTrackHelpers(Board, Track, TargetLayer, Expansion, LeftOffset, RightOffset)
+    DrawTrackRegion(Board, Track, TargetLayer, Expansion, LeftOffset, RightOffset)
   else
-    DrawArcHelpers(Board, Arc, TargetLayer, MilsToCoord(Expansion));
+    DrawArcRegion(Board, Arc, TargetLayer, MilsToCoord(Expansion));
 
-  { 6. Final board refresh }
   Board.ViewManager_FullUpdate;
 
   ShowMessage(
