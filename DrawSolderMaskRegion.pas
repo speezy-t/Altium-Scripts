@@ -4,37 +4,23 @@
 
   PURPOSE
   -------
-  Places a filled solder-mask opening region aligned to a selected copper
-  track or arc on the Top or Bottom signal layer.
-
-  REGION CREATION STRATEGY
-  ------------------------
-  Regions are created directly via the PCB object factory and populated by
-  calling AddPoint on the region's MainContour property.  No helper
-  primitives or RunProcess conversion are used.
+  Places helper primitives on the solder mask layer outlining the intended
+  solder mask opening for a selected copper track or arc.  No region
+  conversion is attempted — the helpers are left in place for manual
+  inspection or conversion.
 
   TRACK CASE
   ----------
-  The region outline is a rotated rectangle defined by four corner points
-  computed from the track geometry (width, expansion, left/right offsets).
+  Four track segments (1 mil wide) are placed on the solder mask layer
+  connecting the four corners of a rotated rectangle aligned to the track.
 
   ARC CASE
   --------
-  The region outline is a polygon that approximates the arc-bounded shape.
-  Points are computed at 1-degree intervals along both the outer arc
-  (radius = CopperRadius + halfWidth + Expansion) and inner arc
-  (radius = CopperRadius - halfWidth - Expansion), then connected at the
-  start and end angles to form a closed loop.  At 1-degree resolution the
-  result is visually indistinguishable from a perfect arc.
-
-  NOTE ON PROPERTY NAME
-  ---------------------
-  If "undeclared identifier: MainContour" is reported, the contour property
-  has a different name in your build.  Candidates to try in order:
-    Region.Outline         (pre-v20 name — was undeclared in our testing)
-    Region.MainContour     (current attempt)
-    Region.GeometricPolygon
-  Replace every occurrence of .MainContour below with the next candidate.
+  Two concentric arcs (0.5 mil wide) share the copper arc's centre, start
+  angle, and end angle.  Their radii are:
+    Outer: CopperRadius + CopperLineWidth/2 + Expansion
+    Inner: CopperRadius - CopperLineWidth/2 - Expansion
+  Two straight track segments (1 mil wide) close the shape at each end.
 
   PRE-CONDITIONS
   --------------
@@ -58,7 +44,72 @@
 
 
 { ---------------------------------------------------------------------------
+  MakeHelperTrack
+  Creates a track segment on TargetLayer, registers it with the board, and
+  returns the object reference.  Must be called inside PreProcess/PostProcess.
+  --------------------------------------------------------------------------- }
+function MakeHelperTrack(Board       : IPCB_Board;
+                         TargetLayer : TLayer;
+                         X1, Y1      : TCoord;
+                         X2, Y2      : TCoord;
+                         LineWidth   : TCoord) : IPCB_Track;
+var
+  T : IPCB_Track;
+begin
+  T         := PCBServer.PCBObjectFactory(eTrackObject, eNoDimension, eCreate_Default);
+  T.X1      := X1;
+  T.Y1      := Y1;
+  T.X2      := X2;
+  T.Y2      := Y2;
+  T.Layer   := TargetLayer;
+  T.Width   := LineWidth;
+
+  Board.AddPCBObject(T);
+  PCBServer.SendMessageToRobots(
+    Board.I_ObjectAddress, c_Broadcast, PCBM_BoardRegisteration, T.I_ObjectAddress);
+
+  Result := T;
+end;
+
+
+{ ---------------------------------------------------------------------------
+  MakeHelperArc
+  Creates an arc on TargetLayer, registers it with the board, and returns
+  the object reference.  Angles in degrees (CCW from positive X axis).
+  Must be called inside PreProcess/PostProcess.
+  --------------------------------------------------------------------------- }
+function MakeHelperArc(Board         : IPCB_Board;
+                       TargetLayer   : TLayer;
+                       CX, CY        : TCoord;
+                       ArcRadius     : TCoord;
+                       StartAngleDeg : Double;
+                       EndAngleDeg   : Double;
+                       LineWidth     : TCoord) : IPCB_Arc;
+var
+  A : IPCB_Arc;
+begin
+  A            := PCBServer.PCBObjectFactory(eArcObject, eNoDimension, eCreate_Default);
+  A.XCenter    := CX;
+  A.YCenter    := CY;
+  A.Radius     := ArcRadius;
+  A.StartAngle := StartAngleDeg;
+  A.EndAngle   := EndAngleDeg;
+  A.Layer      := TargetLayer;
+  A.LineWidth  := LineWidth;
+
+  Board.AddPCBObject(A);
+  PCBServer.SendMessageToRobots(
+    Board.I_ObjectAddress, c_Broadcast, PCBM_BoardRegisteration, A.I_ObjectAddress);
+
+  Result := A;
+end;
+
+
+{ ---------------------------------------------------------------------------
   GetSelectedObject
+  Finds exactly one selected track or arc on the Top or Bottom copper layer.
+  Returns True and sets either Track or Arc (the other is left Nil).
+  Displays an error and returns False if the selection is invalid.
   --------------------------------------------------------------------------- }
 function GetSelectedObject(Board     : IPCB_Board;
                            var Track : IPCB_Track;
@@ -129,6 +180,7 @@ end;
 
 { ---------------------------------------------------------------------------
   ShowParamDialog
+  Collects Expansion, Left Offset, and Right Offset from the user (mils).
   --------------------------------------------------------------------------- }
 procedure ShowParamDialog(var Expansion   : Double;
                           var LeftOffset  : Double;
@@ -264,151 +316,24 @@ end;
 
 
 { ---------------------------------------------------------------------------
-  PlaceTrackRegion
-  Creates a rectangular region directly on TargetLayer using the four
-  pre-computed corner coordinates (in mils).  All geometry is converted to
-  TCoord at the point of the AddPoint call.
+  DrawTrackHelpers
+  Computes the four rotated rectangle corners for a track and places four
+  helper track segments on TargetLayer connecting them (A→B→C→D→A).
 
-  The region outline is populated via Region.MainContour.AddPoint.
-  If "undeclared identifier: MainContour" is reported, replace every
-  occurrence of .MainContour with the correct property name for your build
-  (see the NOTE ON PROPERTY NAME in the file header).
+  All track properties are converted to mils via CoordToMils at the top.
+  Geometry is computed in mils as Double.  Corners are converted back to
+  TCoord via MilsToCoord only at the final MakeHelperTrack call.
+
+  deltaX / deltaY name the along-track direction vector.  These do not
+  collide with the corner variables ax/ay … dx/dy in DelphiScript's
+  case-insensitive environment because "deltaX" ≠ "dx".
   --------------------------------------------------------------------------- }
-procedure PlaceTrackRegion(Board       : IPCB_Board;
+procedure DrawTrackHelpers(Board       : IPCB_Board;
+                           Track       : IPCB_Track;
                            TargetLayer : TLayer;
-                           ax, ay      : Double;
-                           bx, by      : Double;
-                           cx, cy      : Double;
-                           dx, dy      : Double);
-var
-  Region : IPCB_Region;
-begin
-  Region := PCBServer.PCBObjectFactory(eRegionObject, eNoDimension, eCreate_Default);
-  if Region = Nil then
-  begin
-    ShowMessage('Error: Could not create Region object.');
-    Exit;
-  end;
-
-  Region.Layer := TargetLayer;
-
-  Region.MainContour.AddPoint(MilsToCoord(ax), MilsToCoord(ay));
-  Region.MainContour.AddPoint(MilsToCoord(bx), MilsToCoord(by));
-  Region.MainContour.AddPoint(MilsToCoord(cx), MilsToCoord(cy));
-  Region.MainContour.AddPoint(MilsToCoord(dx), MilsToCoord(dy));
-
-  Board.AddPCBObject(Region);
-  PCBServer.SendMessageToRobots(
-    Board.I_ObjectAddress, c_Broadcast, PCBM_BoardRegisteration, Region.I_ObjectAddress);
-end;
-
-
-{ ---------------------------------------------------------------------------
-  PlaceArcRegion
-  Creates a region directly on TargetLayer whose outline approximates the
-  arc-bounded shape using a polygon at 1-degree resolution.
-
-  The polygon is built as follows (viewed from outside the arc):
-    - Outer arc: points from StartAngle to EndAngle at OuterRadius
-    - Inner arc: points from EndAngle back to StartAngle at InnerRadius
-  These two sequences share their first and last points, so the polygon
-  closes naturally.
-
-  SWEEP ANGLE
-  -----------
-  Altium arcs run counterclockwise from StartAngle to EndAngle.
-  If EndAngle <= StartAngle the arc wraps through 0° and the actual
-  counterclockwise sweep = EndAngle - StartAngle + 360.
-  --------------------------------------------------------------------------- }
-procedure PlaceArcRegion(Board          : IPCB_Board;
-                         Arc            : IPCB_Arc;
-                         TargetLayer    : TLayer;
-                         ExpansionCoord : TCoord);
-var
-  HalfWidth    : TCoord;
-  OuterRadius  : TCoord;
-  InnerRadius  : TCoord;
-  SweepDeg     : Double;
-  NumSteps     : Integer;
-  StepDeg      : Double;
-  AngleDeg     : Double;
-  AngleRad     : Double;
-  px, py       : TCoord;
-  i            : Integer;
-  Region       : IPCB_Region;
-begin
-  HalfWidth   := Arc.LineWidth div 2;
-  OuterRadius := Arc.Radius + HalfWidth + ExpansionCoord;
-  InnerRadius := Arc.Radius - HalfWidth - ExpansionCoord;
-
-  if InnerRadius <= 0 then
-  begin
-    ShowMessage(
-      'Warning: Expansion value is too large — inner arc radius would be' + #13#10 +
-      'zero or negative.  Please use a smaller expansion.');
-    Exit;
-  end;
-
-  { Compute the counterclockwise sweep in degrees }
-  SweepDeg := Arc.EndAngle - Arc.StartAngle;
-  if SweepDeg <= 0 then SweepDeg := SweepDeg + 360;
-
-  { One step per degree; minimum of 4 steps for very short arcs }
-  NumSteps := Round(SweepDeg);
-  if NumSteps < 4 then NumSteps := 4;
-  StepDeg := SweepDeg / NumSteps;
-
-  Region := PCBServer.PCBObjectFactory(eRegionObject, eNoDimension, eCreate_Default);
-  if Region = Nil then
-  begin
-    ShowMessage('Error: Could not create Region object.');
-    Exit;
-  end;
-
-  Region.Layer := TargetLayer;
-
-  { Outer arc: StartAngle → EndAngle (counterclockwise) }
-  for i := 0 to NumSteps do
-  begin
-    AngleDeg := Arc.StartAngle + i * StepDeg;
-    AngleRad := AngleDeg * Pi / 180.0;
-    px := Round(Arc.XCenter + OuterRadius * Cos(AngleRad));
-    py := Round(Arc.YCenter + OuterRadius * Sin(AngleRad));
-    Region.MainContour.AddPoint(px, py);
-  end;
-
-  { Inner arc: EndAngle → StartAngle (clockwise — reverse iteration) }
-  for i := NumSteps downto 0 do
-  begin
-    AngleDeg := Arc.StartAngle + i * StepDeg;
-    AngleRad := AngleDeg * Pi / 180.0;
-    px := Round(Arc.XCenter + InnerRadius * Cos(AngleRad));
-    py := Round(Arc.YCenter + InnerRadius * Sin(AngleRad));
-    Region.MainContour.AddPoint(px, py);
-  end;
-
-  Board.AddPCBObject(Region);
-  PCBServer.SendMessageToRobots(
-    Board.I_ObjectAddress, c_Broadcast, PCBM_BoardRegisteration, Region.I_ObjectAddress);
-end;
-
-
-{ ---------------------------------------------------------------------------
-  DrawTrackRegion
-  Computes the rotated rectangle corners for a track and calls PlaceTrackRegion.
-  All geometry is done in mils (Double); TCoord conversion happens inside
-  PlaceTrackRegion at the AddPoint call.
-
-  deltaX / deltaY name the along-track direction vector components.
-  These are distinct from the corner variables ax/ay … dx/dy even in
-  DelphiScript's case-insensitive environment because "deltaX" ≠ "dx".
-  --------------------------------------------------------------------------- }
-procedure DrawTrackRegion(Board       : IPCB_Board;
-                          Track       : IPCB_Track;
-                          TargetLayer : TLayer;
-                          Expansion   : Double;
-                          LeftOffset  : Double;
-                          RightOffset : Double);
+                           Expansion   : Double;
+                           LeftOffset  : Double;
+                           RightOffset : Double);
 var
   Lx, Ly, Rx, Ry  : Double;
   deltaX, deltaY  : Double;
@@ -419,9 +344,8 @@ var
   bx, by          : Double;
   cx, cy          : Double;
   dx, dy          : Double;
+  LineW           : TCoord;
 begin
-  { Assign left/right endpoints (mils).
-    Left = more-negative X; tiebreaker for vertical tracks: lower Y = left. }
   if (Track.X1 < Track.X2) or
      ((Track.X1 = Track.X2) and (Track.Y1 < Track.Y2)) then
   begin
@@ -458,23 +382,82 @@ begin
   cx := Rx - Ro * ux - Half * vx;  cy := Ry - Ro * uy - Half * vy;
   dx := Lx + Lo * ux - Half * vx;  dy := Ly + Lo * uy - Half * vy;
 
+  LineW := MilsToCoord(1);
+
   PCBServer.PreProcess;
-  PlaceTrackRegion(Board, TargetLayer, ax, ay, bx, by, cx, cy, dx, dy);
+  MakeHelperTrack(Board, TargetLayer,
+    MilsToCoord(ax), MilsToCoord(ay), MilsToCoord(bx), MilsToCoord(by), LineW);
+  MakeHelperTrack(Board, TargetLayer,
+    MilsToCoord(bx), MilsToCoord(by), MilsToCoord(cx), MilsToCoord(cy), LineW);
+  MakeHelperTrack(Board, TargetLayer,
+    MilsToCoord(cx), MilsToCoord(cy), MilsToCoord(dx), MilsToCoord(dy), LineW);
+  MakeHelperTrack(Board, TargetLayer,
+    MilsToCoord(dx), MilsToCoord(dy), MilsToCoord(ax), MilsToCoord(ay), LineW);
   PCBServer.PostProcess;
 end;
 
 
 { ---------------------------------------------------------------------------
-  DrawArcRegion
-  Calls PlaceArcRegion inside a PreProcess/PostProcess transaction.
+  DrawArcHelpers
+  Places two concentric arcs and two closing track segments on TargetLayer
+  outlining the solder mask opening for a copper arc.
+
+  Outer arc radius = CopperRadius + CopperLineWidth/2 + Expansion
+  Inner arc radius = CopperRadius - CopperLineWidth/2 - Expansion
+  Both arcs share the copper arc's centre, start angle, and end angle.
+  Closing tracks connect the outer and inner arc endpoints at each end.
   --------------------------------------------------------------------------- }
-procedure DrawArcRegion(Board          : IPCB_Board;
-                        Arc            : IPCB_Arc;
-                        TargetLayer    : TLayer;
-                        ExpansionCoord : TCoord);
+procedure DrawArcHelpers(Board          : IPCB_Board;
+                         Arc            : IPCB_Arc;
+                         TargetLayer    : TLayer;
+                         ExpansionCoord : TCoord);
+var
+  HalfWidth        : TCoord;
+  OuterRadius      : TCoord;
+  InnerRadius      : TCoord;
+  StartRad         : Double;
+  EndRad           : Double;
+  OStartX, OStartY : TCoord;
+  OEndX,   OEndY   : TCoord;
+  IStartX, IStartY : TCoord;
+  IEndX,   IEndY   : TCoord;
 begin
+  HalfWidth   := Arc.LineWidth div 2;
+  OuterRadius := Arc.Radius + HalfWidth + ExpansionCoord;
+  InnerRadius := Arc.Radius - HalfWidth - ExpansionCoord;
+
+  if InnerRadius <= 0 then
+  begin
+    ShowMessage(
+      'Warning: Expansion value is too large — inner arc radius would be' + #13#10 +
+      'zero or negative.  Please use a smaller expansion.');
+    Exit;
+  end;
+
+  StartRad := Arc.StartAngle * Pi / 180.0;
+  EndRad   := Arc.EndAngle   * Pi / 180.0;
+
+  OStartX := Round(Arc.XCenter + OuterRadius * Cos(StartRad));
+  OStartY := Round(Arc.YCenter + OuterRadius * Sin(StartRad));
+  OEndX   := Round(Arc.XCenter + OuterRadius * Cos(EndRad));
+  OEndY   := Round(Arc.YCenter + OuterRadius * Sin(EndRad));
+
+  IStartX := Round(Arc.XCenter + InnerRadius * Cos(StartRad));
+  IStartY := Round(Arc.YCenter + InnerRadius * Sin(StartRad));
+  IEndX   := Round(Arc.XCenter + InnerRadius * Cos(EndRad));
+  IEndY   := Round(Arc.YCenter + InnerRadius * Sin(EndRad));
+
   PCBServer.PreProcess;
-  PlaceArcRegion(Board, Arc, TargetLayer, ExpansionCoord);
+  MakeHelperArc(Board, TargetLayer,
+    Arc.XCenter, Arc.YCenter, OuterRadius,
+    Arc.StartAngle, Arc.EndAngle, MilsToCoord(0.5));
+  MakeHelperArc(Board, TargetLayer,
+    Arc.XCenter, Arc.YCenter, InnerRadius,
+    Arc.StartAngle, Arc.EndAngle, MilsToCoord(0.5));
+  MakeHelperTrack(Board, TargetLayer,
+    OStartX, OStartY, IStartX, IStartY, MilsToCoord(1));
+  MakeHelperTrack(Board, TargetLayer,
+    OEndX, OEndY, IEndX, IEndY, MilsToCoord(1));
   PCBServer.PostProcess;
 end;
 
@@ -516,13 +499,12 @@ begin
   if Cancelled then Exit;
 
   if Track <> Nil then
-    DrawTrackRegion(Board, Track, TargetLayer, Expansion, LeftOffset, RightOffset)
+    DrawTrackHelpers(Board, Track, TargetLayer, Expansion, LeftOffset, RightOffset)
   else
-    DrawArcRegion(Board, Arc, TargetLayer, MilsToCoord(Expansion));
+    DrawArcHelpers(Board, Arc, TargetLayer, MilsToCoord(Expansion));
 
   Board.ViewManager_FullUpdate;
 
   ShowMessage(
-    'Solder mask region placed successfully.' + #13#10 +
-    'Layer: ' + Board.LayerName(TargetLayer));
+    'Helper primitives placed on: ' + Board.LayerName(TargetLayer));
 end;
