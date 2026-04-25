@@ -49,17 +49,6 @@
     C  =  P_R − RightOffset·u −  half·v        (bottom-right)
     D  =  P_L + LeftOffset·u  −  half·v        (bottom-left)
 
-  REGION CREATION STRATEGY
-  ------------------------
-  The IPCB_Region Outline API is not reliably accessible from DelphiScript
-  in Altium 26.  Instead this script replicates the manual workflow:
-    1. Place four track segments on the solder mask layer that connect the
-       four rectangle corners (A→B, B→C, C→D, D→A).
-    2. Deselect all objects, then select only those four segments.
-    3. Run PCB:CreateRegionFromSelectedPrimitives — the same command that
-       Tools → Convert → Create Regions from Selected Primitives invokes.
-    4. Remove the four helper track segments, leaving only the region.
-
   UNDO
   ----
   The placement is wrapped in PCBServer.PreProcess / PostProcess so the
@@ -383,51 +372,25 @@ end;
 
 
 { ---------------------------------------------------------------------------
-  MakeHelperTrack
-  Creates a single track segment on TargetLayer between (X1,Y1) and (X2,Y2),
-  registers it with the board, and returns the object reference so the caller
-  can select and later remove it.
-  Must be called inside a PreProcess / PostProcess block.
-  --------------------------------------------------------------------------- }
-function MakeHelperTrack(Board       : IPCB_Board;
-                         TargetLayer : TLayer;
-                         X1, Y1      : TCoord;
-                         X2, Y2      : TCoord) : IPCB_Track;
-var
-  T : IPCB_Track;
-begin
-  T := PCBServer.PCBObjectFactory(eTrackObject, eNoDimension, eCreate_Default);
-  T.X1    := X1;
-  T.Y1    := Y1;
-  T.X2    := X2;
-  T.Y2    := Y2;
-  T.Layer := TargetLayer;
-  T.Width := MilsToCoord(1);   { minimal width – these are construction lines }
-
-  Board.AddPCBObject(T);
-  PCBServer.SendMessageToRobots(
-    Board.I_ObjectAddress,
-    c_Broadcast,
-    PCBM_BoardRegisteration,
-    T.I_ObjectAddress
-  );
-
-  Result := T;
-end;
-
-
-{ ---------------------------------------------------------------------------
   PlaceRegion
-  Implements the lines-then-convert strategy:
+  Creates a filled rectangular region directly via the IPCB_Region API.
 
-    1. Place four track segments on the solder mask layer that trace the
-       four edges of the rectangle (A→B, B→C, C→D, D→A).
-    2. Deselect all board objects, then select only those four segments.
-    3. Invoke PCB:CreateRegionFromSelectedPrimitives — the same underlying
-       command as Tools → Convert → Create Regions from Selected Primitives.
-    4. Remove the four helper segments.
+  A fresh Region object is obtained from the PCB object factory, its layer
+  is set, and the four corner points are added to its Outline contour in
+  order (A → B → C → D).  Altium closes the polygon automatically.
 
   Must be called inside a PCBServer.PreProcess / PostProcess block.
+
+  NOTE: If Region.Outline.AddPoint raises an "object not initialised" error
+  at runtime, the Outline contour needs to be created explicitly first.
+  In that case replace the four AddPoint calls with:
+      Contour := PCBServer.PCBContourFactory;
+      Contour.AddPoint(Ax, Ay);
+      Contour.AddPoint(Bx, By);
+      Contour.AddPoint(Cx, Cy);
+      Contour.AddPoint(Dx, Dy);
+      Region.Outline := Contour;
+  and add "Contour : IPCB_Contour;" to the var block.
   --------------------------------------------------------------------------- }
 procedure PlaceRegion(Board       : IPCB_Board;
                       TargetLayer : TLayer;
@@ -436,36 +399,32 @@ procedure PlaceRegion(Board       : IPCB_Board;
                       Cx, Cy      : TCoord;
                       Dx, Dy      : TCoord);
 var
-  T1, T2, T3, T4 : IPCB_Track;
+  Region : IPCB_Region;
 begin
-  { --- Step 1: place the four boundary segments --- }
-  T1 := MakeHelperTrack(Board, TargetLayer, Ax, Ay, Bx, By);  { top edge    }
-  T2 := MakeHelperTrack(Board, TargetLayer, Bx, By, Cx, Cy);  { right edge  }
-  T3 := MakeHelperTrack(Board, TargetLayer, Cx, Cy, Dx, Dy);  { bottom edge }
-  T4 := MakeHelperTrack(Board, TargetLayer, Dx, Dy, Ax, Ay);  { left edge   }
+  Region := PCBServer.PCBObjectFactory(eRegionObject, eNoDimension, eCreate_Default);
+  if Region = Nil then
+  begin
+    ShowMessage('Error: Could not create Region object. ' +
+                'Ensure a PCB document is active and try again.');
+    Exit;
+  end;
 
-  { --- Step 2: deselect everything, then select only our four segments ---
-    RunProcess('PCB:DeselAll') clears the board selection without needing
-    to iterate every object manually. }
-  ResetParameters;
-  RunProcess('PCB:DeselAll');
+  Region.Layer := TargetLayer;
+  Region.Kind  := eRegionKind_Copper;
 
-  T1.Selected := True;
-  T2.Selected := True;
-  T3.Selected := True;
-  T4.Selected := True;
+  Region.Outline.AddPoint(Ax, Ay);   { top-left     }
+  Region.Outline.AddPoint(Bx, By);   { top-right    }
+  Region.Outline.AddPoint(Cx, Cy);   { bottom-right }
+  Region.Outline.AddPoint(Dx, Dy);   { bottom-left  }
 
-  { --- Step 3: convert selected primitives to a region ---
-    This is the programmatic equivalent of:
-    Tools → Convert → Create Regions from Selected Primitives }
-  ResetParameters;
-  RunProcess('PCB:CreateRegionFromSelectedPrimitives');
+  Board.AddPCBObject(Region);
 
-  { --- Step 4: remove the helper track segments --- }
-  Board.RemovePCBObject(T1);
-  Board.RemovePCBObject(T2);
-  Board.RemovePCBObject(T3);
-  Board.RemovePCBObject(T4);
+  PCBServer.SendMessageToRobots(
+    Board.I_ObjectAddress,
+    c_Broadcast,
+    PCBM_BoardRegisteration,
+    Region.I_ObjectAddress
+  );
 end;
 
 
