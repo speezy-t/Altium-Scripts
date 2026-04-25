@@ -4,67 +4,123 @@
 
   PURPOSE
   -------
-  Places a rectangular solder-mask opening region that is geometrically
-  aligned to a selected copper track on the Top or Bottom signal layer.
+  Places helper primitives on the solder mask layer that outline the
+  intended solder mask opening for a selected copper track or arc.
 
-  Because Altium renders track/arc solder-mask expansions with rounded
-  end-caps, this script instead draws an explicit rectangular region on
-  the corresponding solder-mask layer (eTopSolder / eBottomSolder) so
-  that the opening meets pad edges cleanly without overlapping them.
+  This is an INTERMEDIATE / VERIFICATION version.  The helpers are left
+  in place so the geometry can be inspected before the conversion-and-
+  cleanup step is added.
+
+  TRACK CASE
+  ----------
+  Four track segments are drawn on the solder mask layer connecting the
+  four corners of the rotated rectangle (A→B top, B→C right, C→D bottom,
+  D→A left).  Width: 1 mil.
+
+  ARC CASE
+  --------
+  Two arcs are drawn concentric with the copper arc:
+    Outer arc radius = CopperRadius + CopperWidth/2 + Expansion
+    Inner arc radius = CopperRadius − CopperWidth/2 − Expansion
+  Both share the copper arc's centre, start angle, and end angle.
+  Two straight track segments connect the endpoint pairs:
+    Start-angle line: outer start point → inner start point
+    End-angle line:   outer end point   → inner end point
+  Arc helper width: 0.5 mil.  Track helper width: 1 mil.
+
+  NOTE: Left/Right offsets apply to tracks only.  They are ignored for arcs.
 
   PRE-CONDITIONS
   --------------
-  * Exactly one track must be selected before running the script.
-  * The track must reside on the Top or Bottom copper layer.
-    Any other selection (arc, via, no object, wrong layer …) is rejected
-    with a descriptive error message.
+  Exactly one track OR one arc must be selected on the Top or Bottom copper
+  layer before running the script.
 
-  DIALOG PARAMETERS  (all values entered in mils)
-  -------------------------------------------------
-  Expansion   – how far beyond the physical edge of the trace (i.e. beyond
-                Width/2) the two long edges of the rectangle extend.
-                Example: trace width 10 mil, expansion 25 mil  →  the
-                rectangle spans ±30 mil from the trace centre-line.
-
-  Left Offset – how far the LEFT short edge of the rectangle is set inward
-                (towards the right endpoint) measured along the trace axis.
-                "Left" always refers to the endpoint with the more-negative
-                X coordinate (Y tiebreaker for vertical traces).
-                Positive value = rectangle does not reach the left endpoint.
-                Default: 0 (rectangle flush with the left endpoint).
-
-  Right Offset– same as Left Offset, but for the RIGHT short edge.
-                Default: 0.
-
-  GEOMETRY
-  --------
-  Let P_L = "left" endpoint, P_R = "right" endpoint.
-  u  = unit vector along the trace (P_L → P_R)
-  v  = unit vector 90° CCW from u (perpendicular, "upward" relative to trace)
-  half = Width/2 + Expansion
-
-  The four rectangle corners in order:
-    A  =  P_L + LeftOffset·u  +  half·v        (top-left)
-    B  =  P_R − RightOffset·u +  half·v        (top-right)
-    C  =  P_R − RightOffset·u −  half·v        (bottom-right)
-    D  =  P_L + LeftOffset·u  −  half·v        (bottom-left)
-
-  UNDO
-  ----
-  The placement is wrapped in PCBServer.PreProcess / PostProcess so the
-  user can undo it with a single Ctrl+Z.
+  DIALOG PARAMETERS  (mils)
+  -------------------------
+  Expansion    – distance beyond the physical edge of the copper primitive
+  Left Offset  – inset of the left/start short edge (tracks only)
+  Right Offset – inset of the right/end short edge (tracks only)
 
   =========================================================================== }
 
 
 { ---------------------------------------------------------------------------
-  GetSelectedTrack
-  Searches the board for selected tracks on the Top or Bottom copper layer.
-  Returns TRUE and sets Track if exactly one qualifying track is found.
-  Displays an appropriate error dialog and returns FALSE otherwise.
+  MakeHelperTrack
+  Creates a track segment on TargetLayer, registers it with the board, and
+  returns the object reference.  Width is in Altium internal units.
+  Must be called inside a PreProcess / PostProcess block.
   --------------------------------------------------------------------------- }
-function GetSelectedTrack(Board     : IPCB_Board;
-                          var Track : IPCB_Track) : Boolean;
+function MakeHelperTrack(Board       : IPCB_Board;
+                         TargetLayer : TLayer;
+                         X1, Y1      : TCoord;
+                         X2, Y2      : TCoord;
+                         LineWidth   : TCoord) : IPCB_Track;
+var
+  T : IPCB_Track;
+begin
+  T         := PCBServer.PCBObjectFactory(eTrackObject, eNoDimension, eCreate_Default);
+  T.X1      := X1;
+  T.Y1      := Y1;
+  T.X2      := X2;
+  T.Y2      := Y2;
+  T.Layer   := TargetLayer;
+  T.Width   := LineWidth;
+
+  Board.AddPCBObject(T);
+  PCBServer.SendMessageToRobots(
+    Board.I_ObjectAddress, c_Broadcast, PCBM_BoardRegisteration, T.I_ObjectAddress
+  );
+
+  Result := T;
+end;
+
+
+{ ---------------------------------------------------------------------------
+  MakeHelperArc
+  Creates an arc on TargetLayer, registers it with the board, and returns
+  the object reference.  All coordinates/radius in Altium internal units;
+  angles in degrees.
+  Must be called inside a PreProcess / PostProcess block.
+  --------------------------------------------------------------------------- }
+function MakeHelperArc(Board        : IPCB_Board;
+                       TargetLayer  : TLayer;
+                       CX, CY       : TCoord;
+                       ArcRadius    : TCoord;
+                       StartAngleDeg : Double;
+                       EndAngleDeg   : Double;
+                       LineWidth    : TCoord) : IPCB_Arc;
+var
+  A : IPCB_Arc;
+begin
+  A             := PCBServer.PCBObjectFactory(eArcObject, eNoDimension, eCreate_Default);
+  A.XCenter     := CX;
+  A.YCenter     := CY;
+  A.Radius      := ArcRadius;
+  A.StartAngle  := StartAngleDeg;
+  A.EndAngle    := EndAngleDeg;
+  A.Layer       := TargetLayer;
+  A.Width       := LineWidth;
+
+  Board.AddPCBObject(A);
+  PCBServer.SendMessageToRobots(
+    Board.I_ObjectAddress, c_Broadcast, PCBM_BoardRegisteration, A.I_ObjectAddress
+  );
+
+  Result := A;
+end;
+
+
+{ ---------------------------------------------------------------------------
+  GetSelectedObject
+  Searches the board for a single selected track or arc on the Top or Bottom
+  copper layer.
+
+  On success returns True and sets either Track (leaving Arc = Nil) or
+  Arc (leaving Track = Nil).  On failure shows an error and returns False.
+  --------------------------------------------------------------------------- }
+function GetSelectedObject(Board     : IPCB_Board;
+                           var Track : IPCB_Track;
+                           var Arc   : IPCB_Arc) : Boolean;
 var
   Iter     : IPCB_BoardIterator;
   Obj      : IPCB_Primitive;
@@ -72,34 +128,50 @@ var
 begin
   Result   := False;
   Track    := Nil;
+  Arc      := Nil;
   SelCount := 0;
 
+  { --- scan tracks --- }
   Iter := Board.BoardIterator_Create;
   Iter.AddFilter_ObjectSet(MkSet(eTrackObject));
   Iter.AddFilter_LayerSet(AllLayers);
-
   Obj := Iter.FirstPCBObject;
   while Obj <> Nil do
   begin
     if Obj.Selected then
-    begin
       if (Obj.Layer = eTopLayer) or (Obj.Layer = eBottomLayer) then
       begin
         Inc(SelCount);
         Track := Obj;
       end;
-    end;
     Obj := Iter.NextPCBObject;
   end;
   Board.BoardIterator_Destroy(Iter);
 
+  { --- scan arcs --- }
+  Iter := Board.BoardIterator_Create;
+  Iter.AddFilter_ObjectSet(MkSet(eArcObject));
+  Iter.AddFilter_LayerSet(AllLayers);
+  Obj := Iter.FirstPCBObject;
+  while Obj <> Nil do
+  begin
+    if Obj.Selected then
+      if (Obj.Layer = eTopLayer) or (Obj.Layer = eBottomLayer) then
+      begin
+        Inc(SelCount);
+        Arc := Obj;
+      end;
+    Obj := Iter.NextPCBObject;
+  end;
+  Board.BoardIterator_Destroy(Iter);
+
+  { --- validate --- }
   if SelCount = 0 then
   begin
     ShowMessage(
       'Error: No qualifying object selected.' + #13#10 + #13#10 +
-      'Please select exactly one track on the Top or Bottom' + #13#10 +
-      'copper layer, then re-run the script.' + #13#10 + #13#10 +
-      'Note: arcs are not yet supported by this script.'
+      'Please select exactly one track or arc on the Top or' + #13#10 +
+      'Bottom copper layer, then re-run the script.'
     );
     Exit;
   end;
@@ -107,11 +179,15 @@ begin
   if SelCount > 1 then
   begin
     ShowMessage(
-      'Error: Multiple tracks are selected (' + IntToStr(SelCount) + ').' + #13#10 + #13#10 +
-      'Please select exactly one track and re-run the script.'
+      'Error: Multiple objects are selected (' + IntToStr(SelCount) + ').' + #13#10 + #13#10 +
+      'Please select exactly one track or arc and re-run the script.'
     );
     Exit;
   end;
+
+  { If both got set somehow (shouldn't happen), prefer track and clear arc }
+  if (Track <> Nil) and (Arc <> Nil) then
+    Arc := Nil;
 
   Result := True;
 end;
@@ -119,17 +195,8 @@ end;
 
 { ---------------------------------------------------------------------------
   ShowParamDialog
-  Builds and displays a modal dialog that collects the three user parameters.
-  Sets Cancelled := True if the user closes/cancels without clicking OK.
-  All returned values are in mils (floating-point).
-
-  NOTE on parsing: Altium's DelphiScript does not expose the standard Pascal
-  Val() procedure. StrToFloatDef(str, fallback) is used instead — it returns
-  the fallback (-1) when the string cannot be parsed, which then fails the
-  >= 0 validation check and re-prompts the user.
-
-  NOTE on Font.Style: DelphiScript does not support bare empty-set literals
-  ([]) as an r-value assignment, so that property is left at its default.
+  Collects Expansion, Left Offset, and Right Offset from the user (mils).
+  Left/Right offsets are labelled as track-only in the UI.
   --------------------------------------------------------------------------- }
 procedure ShowParamDialog(var Expansion   : Double;
                           var LeftOffset  : Double;
@@ -157,95 +224,81 @@ begin
   Dlg := TForm.Create(Nil);
   try
     Dlg.Caption     := 'Solder Mask Region – Parameters';
-    Dlg.Width       := 340;
-    Dlg.Height      := 250;
+    Dlg.Width       := 360;
+    Dlg.Height      := 270;
     Dlg.Position    := poScreenCenter;
     Dlg.BorderStyle := bsDialog;
 
-    { Expansion }
     LblExp         := TLabel.Create(Dlg);
     LblExp.Parent  := Dlg;
     LblExp.Caption := 'Expansion (mils):';
     LblExp.Left    := 16;
     LblExp.Top     := 22;
-    LblExp.Width   := 150;
 
     EdtExp        := TEdit.Create(Dlg);
     EdtExp.Parent := Dlg;
-    EdtExp.Left   := 196;
+    EdtExp.Left   := 210;
     EdtExp.Top    := 18;
     EdtExp.Width  := 110;
     EdtExp.Text   := '0';
 
-    { Left Offset }
     LblLeft         := TLabel.Create(Dlg);
     LblLeft.Parent  := Dlg;
-    LblLeft.Caption := 'Left offset (mils):';
+    LblLeft.Caption := 'Left offset, mils (tracks only):';
     LblLeft.Left    := 16;
     LblLeft.Top     := 62;
-    LblLeft.Width   := 150;
 
     EdtLeft        := TEdit.Create(Dlg);
     EdtLeft.Parent := Dlg;
-    EdtLeft.Left   := 196;
+    EdtLeft.Left   := 210;
     EdtLeft.Top    := 58;
     EdtLeft.Width  := 110;
     EdtLeft.Text   := '0';
 
-    { Right Offset }
     LblRight         := TLabel.Create(Dlg);
     LblRight.Parent  := Dlg;
-    LblRight.Caption := 'Right offset (mils):';
+    LblRight.Caption := 'Right offset, mils (tracks only):';
     LblRight.Left    := 16;
     LblRight.Top     := 102;
-    LblRight.Width   := 150;
 
     EdtRight        := TEdit.Create(Dlg);
     EdtRight.Parent := Dlg;
-    EdtRight.Left   := 196;
+    EdtRight.Left   := 210;
     EdtRight.Top    := 98;
     EdtRight.Width  := 110;
     EdtRight.Text   := '0';
 
-    { Helper note }
     LblNote         := TLabel.Create(Dlg);
     LblNote.Parent  := Dlg;
-    LblNote.Caption := '"Left" = endpoint with more-negative X coordinate.';
+    LblNote.Caption := '"Left" = track endpoint with more-negative X coordinate.';
     LblNote.Left    := 16;
-    LblNote.Top     := 140;
-    LblNote.Width   := 300;
+    LblNote.Top     := 142;
+    LblNote.Width   := 320;
 
-    { OK button }
     BtnOK             := TButton.Create(Dlg);
     BtnOK.Parent      := Dlg;
     BtnOK.Caption     := 'OK';
-    BtnOK.Left        := 140;
-    BtnOK.Top         := 172;
+    BtnOK.Left        := 150;
+    BtnOK.Top         := 192;
     BtnOK.Width       := 80;
     BtnOK.ModalResult := mrOK;
     BtnOK.Default     := True;
 
-    { Cancel button }
     BtnCancel             := TButton.Create(Dlg);
     BtnCancel.Parent      := Dlg;
     BtnCancel.Caption     := 'Cancel';
-    BtnCancel.Left        := 232;
-    BtnCancel.Top         := 172;
+    BtnCancel.Left        := 244;
+    BtnCancel.Top         := 192;
     BtnCancel.Width       := 80;
     BtnCancel.ModalResult := mrCancel;
     BtnCancel.Cancel      := True;
 
-    { Run dialog in a validation loop }
     ValidationOK := False;
     while not ValidationOK do
     begin
-      if Dlg.ShowModal <> mrOK then
-        Exit;   { user cancelled – Cancelled stays True }
+      if Dlg.ShowModal <> mrOK then Exit;
 
       ValidationOK := True;
-
-      { StrToFloatDef returns -1 on a parse failure, which then fails the
-        >= 0 check below and re-prompts the user with a clear message. }
 
       ParsedVal := StrToFloatDef(EdtExp.Text, -1);
       if ParsedVal < 0 then
@@ -283,26 +336,26 @@ end;
 
 
 { ---------------------------------------------------------------------------
-  ComputeRegionVertices
-  Calculates the four corner coordinates (in Altium internal units) of the
-  rotated rectangle.
+  DrawTrackHelpers
+  Computes the four rotated rectangle corners for a track and places four
+  helper track segments on TargetLayer connecting them (A→B→C→D→A).
 
-  All *Coord parameters must already be in Altium internal units
-  (use MilsToCoord before calling this procedure).
-
-  Corner labelling (viewed from above, trace running left → right):
-    A ------- B
-    |         |
-    D ------- C
+  Geometry:
+    u    = unit vector along track (left endpoint → right endpoint)
+    v    = unit vector 90° CCW from u
+    half = Width/2 + Expansion
+    A (top-left)     = P_L + Lo·u + half·v
+    B (top-right)    = P_R − Ro·u + half·v
+    C (bottom-right) = P_R − Ro·u − half·v
+    D (bottom-left)  = P_L + Lo·u − half·v
+  "Left" endpoint = more-negative X (Y tiebreaker for vertical tracks).
   --------------------------------------------------------------------------- }
-procedure ComputeRegionVertices(Track            : IPCB_Track;
-                                ExpansionCoord   : TCoord;
-                                LeftOffsetCoord  : TCoord;
-                                RightOffsetCoord : TCoord;
-                                var Ax, Ay       : TCoord;
-                                var Bx, By       : TCoord;
-                                var Cx, Cy       : TCoord;
-                                var Dx, Dy       : TCoord);
+procedure DrawTrackHelpers(Board            : IPCB_Board;
+                           Track            : IPCB_Track;
+                           TargetLayer      : TLayer;
+                           ExpansionCoord   : TCoord;
+                           LeftOffsetCoord  : TCoord;
+                           RightOffsetCoord : TCoord);
 var
   Lx, Ly       : Double;
   Rx, Ry       : Double;
@@ -310,21 +363,24 @@ var
   TraceLen     : Double;
   ux, uy       : Double;
   vx, vy       : Double;
-  Half         : Double;
-  Lo, Ro       : Double;
+  Half, Lo, Ro : Double;
+  Ax, Ay       : TCoord;
+  Bx, By       : TCoord;
+  Cx, Cy       : TCoord;
+  Dx, Dy       : TCoord;
+  HalfWidth    : TCoord;
 begin
-  { Assign "left" and "right" endpoints.
-    Left = more-negative X; Y is the tiebreaker for vertical tracks. }
+  { Assign left/right endpoints }
   if (Track.X1 < Track.X2) or
      ((Track.X1 = Track.X2) and (Track.Y1 < Track.Y2)) then
   begin
-    Lx := Track.X1;   Ly := Track.Y1;
-    Rx := Track.X2;   Ry := Track.Y2;
+    Lx := Track.X1;  Ly := Track.Y1;
+    Rx := Track.X2;  Ry := Track.Y2;
   end
   else
   begin
-    Lx := Track.X2;   Ly := Track.Y2;
-    Rx := Track.X1;   Ry := Track.Y1;
+    Lx := Track.X2;  Ly := Track.Y2;
+    Rx := Track.X1;  Ry := Track.Y1;
   end;
 
   dRawX    := Rx - Lx;
@@ -333,98 +389,108 @@ begin
 
   if TraceLen < 1 then
   begin
-    Ax := Round(Lx); Ay := Round(Ly);
-    Bx := Ax;        By := Ay;
-    Cx := Ax;        Cy := Ay;
-    Dx := Ax;        Dy := Ay;
-    ShowMessage('Warning: The selected track has zero (or near-zero) length. ' +
-                'Region placement skipped.');
+    ShowMessage('Warning: The selected track has zero (or near-zero) length. Skipped.');
     Exit;
   end;
 
   ux := dRawX / TraceLen;
   uy := dRawY / TraceLen;
-
-  { Perpendicular unit vector (90° CCW) }
   vx := -uy;
   vy :=  ux;
 
-  Half := (Track.Width / 2) + ExpansionCoord;
+  Half := (Track.Width / 2.0) + ExpansionCoord;
   Lo   := LeftOffsetCoord;
   Ro   := RightOffsetCoord;
 
-  { A: top-left }
   Ax := Round(Lx + Lo * ux + Half * vx);
   Ay := Round(Ly + Lo * uy + Half * vy);
-
-  { B: top-right }
   Bx := Round(Rx - Ro * ux + Half * vx);
   By := Round(Ry - Ro * uy + Half * vy);
-
-  { C: bottom-right }
   Cx := Round(Rx - Ro * ux - Half * vx);
   Cy := Round(Ry - Ro * uy - Half * vy);
-
-  { D: bottom-left }
   Dx := Round(Lx + Lo * ux - Half * vx);
   Dy := Round(Ly + Lo * uy - Half * vy);
+
+  HalfWidth := MilsToCoord(1);
+
+  MakeHelperTrack(Board, TargetLayer, Ax, Ay, Bx, By, HalfWidth);  { top edge    }
+  MakeHelperTrack(Board, TargetLayer, Bx, By, Cx, Cy, HalfWidth);  { right edge  }
+  MakeHelperTrack(Board, TargetLayer, Cx, Cy, Dx, Dy, HalfWidth);  { bottom edge }
+  MakeHelperTrack(Board, TargetLayer, Dx, Dy, Ax, Ay, HalfWidth);  { left edge   }
 end;
 
 
 { ---------------------------------------------------------------------------
-  PlaceRegion
-  Creates a filled rectangular region directly via the IPCB_Region API.
+  DrawArcHelpers
+  Places the four helper primitives that outline the solder mask opening for
+  a copper arc:
+    - Outer helper arc: same centre/angles, radius = ArcRadius + half-width + Expansion
+    - Inner helper arc: same centre/angles, radius = ArcRadius − half-width − Expansion
+    - Start-angle line: outer start point → inner start point
+    - End-angle   line: outer end point   → inner end point
 
-  A fresh Region object is obtained from the PCB object factory, its layer
-  is set, and the four corner points are added to its Outline contour in
-  order (A → B → C → D).  Altium closes the polygon automatically.
-
-  Must be called inside a PCBServer.PreProcess / PostProcess block.
-
-  NOTE: If Region.Outline.AddPoint raises an "object not initialised" error
-  at runtime, the Outline contour needs to be created explicitly first.
-  In that case replace the four AddPoint calls with:
-      Contour := PCBServer.PCBContourFactory;
-      Contour.AddPoint(Ax, Ay);
-      Contour.AddPoint(Bx, By);
-      Contour.AddPoint(Cx, Cy);
-      Contour.AddPoint(Dx, Dy);
-      Region.Outline := Contour;
-  and add "Contour : IPCB_Contour;" to the var block.
+  All arc helper widths are 0.5 mil; connecting line widths are 1 mil.
+  Angles are in degrees (Altium convention, CCW from positive X axis).
   --------------------------------------------------------------------------- }
-procedure PlaceRegion(Board       : IPCB_Board;
-                      TargetLayer : TLayer;
-                      Ax, Ay      : TCoord;
-                      Bx, By      : TCoord;
-                      Cx, Cy      : TCoord;
-                      Dx, Dy      : TCoord);
+procedure DrawArcHelpers(Board          : IPCB_Board;
+                         Arc            : IPCB_Arc;
+                         TargetLayer    : TLayer;
+                         ExpansionCoord : TCoord);
 var
-  Region : IPCB_Region;
+  HalfWidth    : TCoord;
+  OuterRadius  : TCoord;
+  InnerRadius  : TCoord;
+  StartRad     : Double;
+  EndRad       : Double;
+  OStartX, OStartY : TCoord;   { outer arc start point }
+  OEndX,   OEndY   : TCoord;   { outer arc end point   }
+  IStartX, IStartY : TCoord;   { inner arc start point }
+  IEndX,   IEndY   : TCoord;   { inner arc end point   }
 begin
-  Region := PCBServer.PCBObjectFactory(eRegionObject, eNoDimension, eCreate_Default);
-  if Region = Nil then
+  HalfWidth   := Arc.Width div 2;
+  OuterRadius := Arc.Radius + HalfWidth + ExpansionCoord;
+  InnerRadius := Arc.Radius - HalfWidth - ExpansionCoord;
+
+  if InnerRadius <= 0 then
   begin
-    ShowMessage('Error: Could not create Region object. ' +
-                'Ensure a PCB document is active and try again.');
+    ShowMessage(
+      'Warning: The expansion value is too large — the inner helper arc' + #13#10 +
+      'radius would be zero or negative.  Please use a smaller expansion.'
+    );
     Exit;
   end;
 
-  Region.Layer := TargetLayer;
-  Region.Kind  := eRegionKind_Copper;
+  { Place the two concentric helper arcs }
+  MakeHelperArc(Board, TargetLayer,
+                Arc.XCenter, Arc.YCenter,
+                OuterRadius,
+                Arc.StartAngle, Arc.EndAngle,
+                MilsToCoord(0.5));
 
-  Region.Outline.AddPoint(Ax, Ay);   { top-left     }
-  Region.Outline.AddPoint(Bx, By);   { top-right    }
-  Region.Outline.AddPoint(Cx, Cy);   { bottom-right }
-  Region.Outline.AddPoint(Dx, Dy);   { bottom-left  }
+  MakeHelperArc(Board, TargetLayer,
+                Arc.XCenter, Arc.YCenter,
+                InnerRadius,
+                Arc.StartAngle, Arc.EndAngle,
+                MilsToCoord(0.5));
 
-  Board.AddPCBObject(Region);
+  { Compute the four arc endpoints so we can draw the closing lines.
+    Altium arc angles are in degrees, CCW from positive X axis. }
+  StartRad := Arc.StartAngle * Pi / 180.0;
+  EndRad   := Arc.EndAngle   * Pi / 180.0;
 
-  PCBServer.SendMessageToRobots(
-    Board.I_ObjectAddress,
-    c_Broadcast,
-    PCBM_BoardRegisteration,
-    Region.I_ObjectAddress
-  );
+  OStartX := Round(Arc.XCenter + OuterRadius * Cos(StartRad));
+  OStartY := Round(Arc.YCenter + OuterRadius * Sin(StartRad));
+  OEndX   := Round(Arc.XCenter + OuterRadius * Cos(EndRad));
+  OEndY   := Round(Arc.YCenter + OuterRadius * Sin(EndRad));
+
+  IStartX := Round(Arc.XCenter + InnerRadius * Cos(StartRad));
+  IStartY := Round(Arc.YCenter + InnerRadius * Sin(StartRad));
+  IEndX   := Round(Arc.XCenter + InnerRadius * Cos(EndRad));
+  IEndY   := Round(Arc.YCenter + InnerRadius * Sin(EndRad));
+
+  { Closing lines at each end of the arc }
+  MakeHelperTrack(Board, TargetLayer, OStartX, OStartY, IStartX, IStartY, MilsToCoord(1));
+  MakeHelperTrack(Board, TargetLayer, OEndX,   OEndY,   IEndX,   IEndY,   MilsToCoord(1));
 end;
 
 
@@ -435,17 +501,14 @@ procedure DrawSolderMaskRegion;
 var
   Board       : IPCB_Board;
   Track       : IPCB_Track;
+  Arc         : IPCB_Arc;
   TargetLayer : TLayer;
+  SourceLayer : TLayer;
 
   Expansion   : Double;
   LeftOffset  : Double;
   RightOffset : Double;
   Cancelled   : Boolean;
-
-  Ax, Ay : TCoord;
-  Bx, By : TCoord;
-  Cx, Cy : TCoord;
-  Dx, Dy : TCoord;
 begin
   { 1. Obtain active PCB document }
   Board := PCBServer.GetCurrentPCBBoard;
@@ -456,13 +519,18 @@ begin
     Exit;
   end;
 
-  { 2. Locate and validate the selected track }
+  { 2. Locate and validate the selected track or arc }
   Track := Nil;
-  if not GetSelectedTrack(Board, Track) then
-    Exit;
+  Arc   := Nil;
+  if not GetSelectedObject(Board, Track, Arc) then Exit;
 
-  { 3. Resolve the target solder-mask layer }
-  if Track.Layer = eTopLayer then
+  { 3. Resolve source and target layers }
+  if Track <> Nil then
+    SourceLayer := Track.Layer
+  else
+    SourceLayer := Arc.Layer;
+
+  if SourceLayer = eTopLayer then
     TargetLayer := eTopSolder
   else
     TargetLayer := eBottomSolder;
@@ -471,31 +539,27 @@ begin
   ShowParamDialog(Expansion, LeftOffset, RightOffset, Cancelled);
   if Cancelled then Exit;
 
-  { 5. Compute the four rectangle corners }
-  ComputeRegionVertices(
-    Track,
-    MilsToCoord(Expansion),
-    MilsToCoord(LeftOffset),
-    MilsToCoord(RightOffset),
-    Ax, Ay,
-    Bx, By,
-    Cx, Cy,
-    Dx, Dy
-  );
-
-  { 6. Place the region (undo-safe transaction) }
+  { 5. Draw helper primitives (undo-safe transaction) }
   PCBServer.PreProcess;
   try
-    PlaceRegion(Board, TargetLayer, Ax, Ay, Bx, By, Cx, Cy, Dx, Dy);
+    if Track <> Nil then
+      DrawTrackHelpers(Board, Track, TargetLayer,
+                       MilsToCoord(Expansion),
+                       MilsToCoord(LeftOffset),
+                       MilsToCoord(RightOffset))
+    else
+      DrawArcHelpers(Board, Arc, TargetLayer,
+                     MilsToCoord(Expansion));
   finally
     PCBServer.PostProcess;
   end;
 
-  { 7. Refresh the board view }
+  { 6. Refresh the board view }
   Board.ViewManager_FullUpdate;
 
   ShowMessage(
-    'Solder mask region placed successfully.' + #13#10 +
-    'Layer: ' + Board.LayerName(TargetLayer)
+    'Helper primitives placed on: ' + Board.LayerName(TargetLayer) + #13#10 +
+    'Please verify the geometry, then report back to proceed' + #13#10 +
+    'with region conversion and cleanup.'
   );
 end;
