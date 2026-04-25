@@ -9,8 +9,8 @@
 
   Because Altium renders track/arc solder-mask expansions with rounded
   end-caps, this script instead draws an explicit rectangular region on
-  the corresponding solder-mask layer (eTopSolderMask / eBottomSolderMask)
-  so that the opening meets pad edges cleanly without overlapping them.
+  the corresponding solder-mask layer so that the opening meets pad edges
+  cleanly without overlapping them.
 
   PRE-CONDITIONS
   --------------
@@ -43,7 +43,7 @@
   v  = unit vector 90° CCW from u (perpendicular, "upward" relative to trace)
   half = Width/2 + Expansion
 
-  The four rectangle corners in order (CCW from top-left):
+  The four rectangle corners in order:
     A  =  P_L + LeftOffset·u  +  half·v        (top-left)
     B  =  P_R − RightOffset·u +  half·v        (top-right)
     C  =  P_R − RightOffset·u −  half·v        (bottom-right)
@@ -56,13 +56,67 @@
 
   =========================================================================== }
 
+
+{ ---------------------------------------------------------------------------
+  ResolveSolderMaskLayer
+  ---------------------------------------------------------------------------
+  In Altium 26 the legacy layer-constant identifiers eTopSolderMask and
+  eBottomSolderMask are no longer declared in the scripting environment.
+  Solder-mask layers must instead be resolved at run-time by walking the
+  board's V7 layer stack and checking each layer's LayerClass.
+
+  In a standard stackup the layers are ordered top-to-bottom, so the FIRST
+  solder-mask layer encountered is always the Top Solder Mask and the LAST
+  is the Bottom Solder Mask.
+
+  IsTop = True  → returns Top Solder Mask layer ID
+  IsTop = False → returns Bottom Solder Mask layer ID
+
+  Returns -1 if no qualifying layer can be found (caller must check).
+  --------------------------------------------------------------------------- }
+function ResolveSolderMaskLayer(Board : IPCB_Board;
+                                IsTop : Boolean) : TLayer;
+var
+  Stack    : IPCB_LayerStack_V7;
+  Layer    : IPCB_LayerObject_V7;
+  i        : Integer;
+  SMCount  : Integer;
+  FirstSM  : TLayer;
+  LastSM   : TLayer;
+begin
+  Result  := -1;
+  SMCount := 0;
+  FirstSM := -1;
+  LastSM  := -1;
+
+  Stack := Board.LayerStack_V7;
+  if Stack = Nil then Exit;
+
+  for i := 0 to Stack.Count - 1 do
+  begin
+    Layer := Stack.LayerObject_V7[i];
+    if (Layer <> Nil) and (Layer.LayerClass = eLayerClass_SolderMask) then
+    begin
+      Inc(SMCount);
+      if SMCount = 1 then FirstSM := Layer.LayerID;
+      LastSM := Layer.LayerID;   { keep updating; ends on the final SM layer }
+    end;
+  end;
+
+  if IsTop then
+    Result := FirstSM
+  else
+    Result := LastSM;
+end;
+
+
 { ---------------------------------------------------------------------------
   GetSelectedTrack
   Searches the board for selected tracks on the Top or Bottom copper layer.
   Returns TRUE and sets Track if exactly one qualifying track is found.
   Displays an appropriate error dialog and returns FALSE otherwise.
   --------------------------------------------------------------------------- }
-function GetSelectedTrack(Board : IPCB_Board;
+function GetSelectedTrack(Board    : IPCB_Board;
                           var Track : IPCB_Track) : Boolean;
 var
   Iter     : IPCB_BoardIterator;
@@ -73,7 +127,6 @@ begin
   Track    := Nil;
   SelCount := 0;
 
-  { Iterate over every track object on every layer }
   Iter := Board.BoardIterator_Create;
   Iter.AddFilter_ObjectSet(MkSet(eTrackObject));
   Iter.AddFilter_LayerSet(AllLayers);
@@ -93,7 +146,6 @@ begin
   end;
   Board.BoardIterator_Destroy(Iter);
 
-  { --- Validation --- }
   if SelCount = 0 then
   begin
     ShowMessage(
@@ -117,11 +169,16 @@ begin
   Result := True;
 end;
 
+
 { ---------------------------------------------------------------------------
   ShowParamDialog
   Builds and displays a modal dialog that collects the three user parameters.
   Sets Cancelled := True if the user closes/cancels without clicking OK.
   All returned values are in mils (floating-point).
+
+  NOTE on Font.Style: DelphiScript does not support bare empty-set literals
+  ([]) as an r-value.  The correct syntax is TFontStyles([]), but since the
+  label style is cosmetic the property is simply left at its default here.
   --------------------------------------------------------------------------- }
 procedure ShowParamDialog(var Expansion   : Double;
                           var LeftOffset  : Double;
@@ -147,7 +204,6 @@ begin
   RightOffset := 0;
   Cancelled   := True;
 
-  { ---- Build dialog ---- }
   Dlg := TForm.Create(Nil);
   try
     Dlg.Caption     := 'Solder Mask Region – Parameters';
@@ -201,25 +257,23 @@ begin
     EdtRight.Width  := 110;
     EdtRight.Text   := '0';
 
-    { Helper note }
+    { Helper note (Font.Style intentionally not set – see procedure note above) }
     LblNote         := TLabel.Create(Dlg);
     LblNote.Parent  := Dlg;
     LblNote.Caption := '"Left" = endpoint with more-negative X coordinate.';
     LblNote.Left    := 16;
     LblNote.Top     := 140;
     LblNote.Width   := 300;
-    LblNote.Font.Style := [];
-    LblNote.Font.Color := clGray;
 
     { OK button }
-    BtnOK               := TButton.Create(Dlg);
-    BtnOK.Parent        := Dlg;
-    BtnOK.Caption       := 'OK';
-    BtnOK.Left          := 140;
-    BtnOK.Top           := 172;
-    BtnOK.Width         := 80;
-    BtnOK.ModalResult   := mrOK;
-    BtnOK.Default       := True;
+    BtnOK             := TButton.Create(Dlg);
+    BtnOK.Parent      := Dlg;
+    BtnOK.Caption     := 'OK';
+    BtnOK.Left        := 140;
+    BtnOK.Top         := 172;
+    BtnOK.Width       := 80;
+    BtnOK.ModalResult := mrOK;
+    BtnOK.Default     := True;
 
     { Cancel button }
     BtnCancel             := TButton.Create(Dlg);
@@ -231,14 +285,13 @@ begin
     BtnCancel.ModalResult := mrCancel;
     BtnCancel.Cancel      := True;
 
-    { ---- Run dialog in a validation loop ---- }
+    { Run dialog in a validation loop }
     ValidationOK := False;
     while not ValidationOK do
     begin
       if Dlg.ShowModal <> mrOK then
         Exit;   { user cancelled – Cancelled stays True }
 
-      { Parse and validate each field }
       ValidationOK := True;
 
       Val(EdtExp.Text, ParsedVal, Code);
@@ -275,6 +328,7 @@ begin
   end;
 end;
 
+
 { ---------------------------------------------------------------------------
   ComputeRegionVertices
   Calculates the four corner coordinates (in Altium internal units) of the
@@ -297,21 +351,17 @@ procedure ComputeRegionVertices(Track            : IPCB_Track;
                                 var Cx, Cy       : TCoord;
                                 var Dx, Dy       : TCoord);
 var
-  { Endpoint coordinates as doubles for floating-point arithmetic }
-  Lx, Ly  : Double;   { "left"  endpoint (more-negative X, or Y as tiebreak) }
-  Rx, Ry  : Double;   { "right" endpoint }
-
-  dRawX, dRawY : Double;   { vector from left to right }
-  TraceLen     : Double;   { Euclidean length of track }
-
-  ux, uy   : Double;   { unit vector along trace direction (L → R)    }
-  vx, vy   : Double;   { unit vector perpendicular, 90° CCW from u    }
-
-  Half     : Double;   { = Width/2 + expansion, in internal units     }
-  Lo, Ro   : Double;   { left / right offsets as doubles              }
+  Lx, Ly       : Double;
+  Rx, Ry       : Double;
+  dRawX, dRawY : Double;
+  TraceLen     : Double;
+  ux, uy       : Double;
+  vx, vy       : Double;
+  Half         : Double;
+  Lo, Ro       : Double;
 begin
-  { ---- Assign "left" and "right" endpoints ---- }
-  { Left  = more-negative X; Y is the tiebreaker for vertical tracks. }
+  { Assign "left" and "right" endpoints.
+    Left  = more-negative X; Y is the tiebreaker for vertical tracks. }
   if (Track.X1 < Track.X2) or
      ((Track.X1 = Track.X2) and (Track.Y1 < Track.Y2)) then
   begin
@@ -324,12 +374,10 @@ begin
     Rx := Track.X1;   Ry := Track.Y1;
   end;
 
-  { ---- Direction vector and length ---- }
   dRawX    := Rx - Lx;
   dRawY    := Ry - Ly;
   TraceLen := Sqrt(dRawX * dRawX + dRawY * dRawY);
 
-  { Guard against a degenerate (zero-length) track }
   if TraceLen < 1 then
   begin
     Ax := Round(Lx); Ay := Round(Ly);
@@ -341,21 +389,17 @@ begin
     Exit;
   end;
 
-  { Unit vector along track }
   ux := dRawX / TraceLen;
   uy := dRawY / TraceLen;
 
-  { Unit vector perpendicular to track (90° CCW rotation) }
+  { Perpendicular unit vector (90° CCW) }
   vx := -uy;
   vy :=  ux;
 
-  { Half-width including expansion }
   Half := (Track.Width / 2) + ExpansionCoord;
+  Lo   := LeftOffsetCoord;
+  Ro   := RightOffsetCoord;
 
-  Lo := LeftOffsetCoord;
-  Ro := RightOffsetCoord;
-
-  { ---- Four rectangle corners ---- }
   { A: top-left }
   Ax := Round(Lx + Lo * ux + Half * vx);
   Ay := Round(Ly + Lo * uy + Half * vy);
@@ -372,6 +416,7 @@ begin
   Dx := Round(Lx + Lo * ux - Half * vx);
   Dy := Round(Ly + Lo * uy - Half * vy);
 end;
+
 
 { ---------------------------------------------------------------------------
   PlaceRegion
@@ -396,9 +441,8 @@ begin
   end;
 
   Region.Layer := TargetLayer;
-  Region.Kind  := eRegionKind_Copper;  { solid filled region on the target layer }
+  Region.Kind  := eRegionKind_Copper;
 
-  { Add the four corners – Altium closes the polygon automatically }
   Region.Outline.AddPoint(Ax, Ay);   { top-left     }
   Region.Outline.AddPoint(Bx, By);   { top-right    }
   Region.Outline.AddPoint(Cx, Cy);   { bottom-right }
@@ -406,7 +450,6 @@ begin
 
   Board.AddPCBObject(Region);
 
-  { Notify the board that a new object has been registered }
   PCBServer.SendMessageToRobots(
     Board.I_ObjectAddress,
     c_Broadcast,
@@ -414,6 +457,7 @@ begin
     Region.I_ObjectAddress
   );
 end;
+
 
 { ===========================================================================
   DrawSolderMaskRegion  –  SCRIPT ENTRY POINT
@@ -424,21 +468,17 @@ var
   Track       : IPCB_Track;
   TargetLayer : TLayer;
 
-  { User inputs (mils) }
   Expansion   : Double;
   LeftOffset  : Double;
   RightOffset : Double;
   Cancelled   : Boolean;
 
-  { Rectangle corner coordinates (internal units) }
   Ax, Ay : TCoord;
   Bx, By : TCoord;
   Cx, Cy : TCoord;
   Dx, Dy : TCoord;
 begin
-  { ------------------------------------------------------------------ }
-  { 1. Obtain active PCB document                                        }
-  { ------------------------------------------------------------------ }
+  { 1. Obtain active PCB document }
   Board := PCBServer.GetCurrentPCBBoard;
   if Board = Nil then
   begin
@@ -447,30 +487,31 @@ begin
     Exit;
   end;
 
-  { ------------------------------------------------------------------ }
-  { 2. Locate and validate the selected track                            }
-  { ------------------------------------------------------------------ }
+  { 2. Locate and validate the selected track }
   Track := Nil;
   if not GetSelectedTrack(Board, Track) then
     Exit;
 
-  { ------------------------------------------------------------------ }
-  { 3. Resolve the target solder-mask layer from the track's layer      }
-  { ------------------------------------------------------------------ }
+  { 3. Resolve the target solder-mask layer via the V7 layer stack }
   if Track.Layer = eTopLayer then
-    TargetLayer := eTopSolderMask
+    TargetLayer := ResolveSolderMaskLayer(Board, True)
   else
-    TargetLayer := eBottomSolderMask;
+    TargetLayer := ResolveSolderMaskLayer(Board, False);
 
-  { ------------------------------------------------------------------ }
-  { 4. Collect parameters from the user                                  }
-  { ------------------------------------------------------------------ }
+  if TargetLayer = -1 then
+  begin
+    ShowMessage(
+      'Error: Could not locate the solder mask layer for this board.' + #13#10 +
+      'Verify that your layer stack contains a Top/Bottom Solder Mask layer.'
+    );
+    Exit;
+  end;
+
+  { 4. Collect parameters from the user }
   ShowParamDialog(Expansion, LeftOffset, RightOffset, Cancelled);
   if Cancelled then Exit;
 
-  { ------------------------------------------------------------------ }
-  { 5. Compute the four rectangle corners                                }
-  { ------------------------------------------------------------------ }
+  { 5. Compute the four rectangle corners }
   ComputeRegionVertices(
     Track,
     MilsToCoord(Expansion),
@@ -482,9 +523,7 @@ begin
     Dx, Dy
   );
 
-  { ------------------------------------------------------------------ }
-  { 6. Place the region (undo-safe transaction)                          }
-  { ------------------------------------------------------------------ }
+  { 6. Place the region (undo-safe transaction) }
   PCBServer.PreProcess;
   try
     PlaceRegion(Board, TargetLayer, Ax, Ay, Bx, By, Cx, Cy, Dx, Dy);
@@ -492,9 +531,7 @@ begin
     PCBServer.PostProcess;
   end;
 
-  { ------------------------------------------------------------------ }
-  { 7. Refresh the board view                                            }
-  { ------------------------------------------------------------------ }
+  { 7. Refresh the board view }
   Board.ViewManager_FullUpdate;
 
   ShowMessage(
