@@ -4,49 +4,51 @@
 
   PURPOSE
   -------
-  Places helper primitives on the solder mask layer outlining the intended
-  solder mask opening for a selected copper track or arc.  No region
-  conversion is attempted — the helpers are left in place for manual
-  inspection or conversion.
+  Places solder mask helper primitives outlining the intended opening for
+  a selection of one or more connected copper tracks and/or arcs on the
+  Top or Bottom signal layer.
 
-  TRACK CASE
-  ----------
-  Four track segments (1 mil wide) are placed on the solder mask layer
-  connecting the four corners of a rotated rectangle aligned to the track.
+  For each selected primitive the outer long edges are always drawn.  The
+  closing edges (short perpendicular segments for tracks; end-cap lines for
+  arcs) are drawn only at EXTERNAL endpoints — endpoints that are not shared
+  with any other selected primitive.  Internal closing edges are suppressed,
+  leaving a continuous outer boundary for the entire selection.
 
-  ARC CASE
-  --------
-  Two concentric arcs (0.5 mil wide) share the copper arc's centre, start
-  angle, and end angle.  Their radii are:
-    Outer: CopperRadius + CopperLineWidth/2 + Expansion
-    Inner: CopperRadius - CopperLineWidth/2 - Expansion
-  Two straight track segments (1 mil wide) close the shape at each end.
+  NOTE ON CORNER GAPS
+  -------------------
+  At junctions between two tracks that meet at an angle, the outer long
+  edges of the two rectangles do not share an endpoint exactly.  A small
+  open gap will appear at each such corner.  These gaps can be closed
+  manually before converting to a region.  Tangentially connected track-arc
+  pairs with equal widths do not produce gaps.
 
-  PRE-CONDITIONS
-  --------------
-  Exactly one track OR one arc must be selected on the Top or Bottom copper
-  layer before running the script.
+  LAYER REQUIREMENT
+  -----------------
+  All selected primitives must be on the same copper layer (Top or Bottom).
 
   DIALOG PARAMETERS  (mils)
   -------------------------
-  Expansion    – distance beyond the physical edge of the copper primitive
-  Left Offset  – inset of the left/start short edge along trace (tracks only)
-  Right Offset – inset of the right/end short edge along trace (tracks only)
+  Expansion    – distance beyond the physical edge of each copper primitive
+  Left Offset  – inset of the chain's left-end short edge  (tracks only)
+  Right Offset – inset of the chain's right-end short edge (tracks only)
 
-  LEFT / RIGHT ENDPOINT CONVENTION  (tracks)
-  ------------------------------------------
-  "Left"  = endpoint with the more-negative X coordinate.
-  Tiebreaker for exactly vertical tracks (X1 = X2):
-    "Left"  = more-negative Y endpoint (bottom in Altium's upward-Y system)
-    "Right" = more-positive Y endpoint (top)
+  "Left" end  = the external endpoint with the more-negative X coordinate
+                (tiebreaker: more-negative Y for vertical chains).
+  Offsets are ignored when the corresponding chain end is an arc.
+
+  LIMITATIONS
+  -----------
+  * Maximum 50 primitives per selection.
+  * Endpoint matching uses 0.5 mil tolerance.
+  * Corner gaps at angled track-track junctions must be closed manually.
+  * Branched selections (more than 2 external endpoints) are accepted but
+    offsets are not applied (the chain topology is ambiguous).
 
   =========================================================================== }
 
 
 { ---------------------------------------------------------------------------
-  MakeHelperTrack
-  Creates a track segment on TargetLayer, registers it with the board, and
-  returns the object reference.  Must be called inside PreProcess/PostProcess.
+  MakeHelperTrack — places one track segment and returns it
   --------------------------------------------------------------------------- }
 function MakeHelperTrack(Board       : IPCB_Board;
                          TargetLayer : TLayer;
@@ -56,27 +58,20 @@ function MakeHelperTrack(Board       : IPCB_Board;
 var
   T : IPCB_Track;
 begin
-  T         := PCBServer.PCBObjectFactory(eTrackObject, eNoDimension, eCreate_Default);
-  T.X1      := X1;
-  T.Y1      := Y1;
-  T.X2      := X2;
-  T.Y2      := Y2;
-  T.Layer   := TargetLayer;
-  T.Width   := LineWidth;
-
+  T       := PCBServer.PCBObjectFactory(eTrackObject, eNoDimension, eCreate_Default);
+  T.X1    := X1;  T.Y1 := Y1;
+  T.X2    := X2;  T.Y2 := Y2;
+  T.Layer := TargetLayer;
+  T.Width := LineWidth;
   Board.AddPCBObject(T);
   PCBServer.SendMessageToRobots(
     Board.I_ObjectAddress, c_Broadcast, PCBM_BoardRegisteration, T.I_ObjectAddress);
-
   Result := T;
 end;
 
 
 { ---------------------------------------------------------------------------
-  MakeHelperArc
-  Creates an arc on TargetLayer, registers it with the board, and returns
-  the object reference.  Angles in degrees (CCW from positive X axis).
-  Must be called inside PreProcess/PostProcess.
+  MakeHelperArc — places one arc and returns it
   --------------------------------------------------------------------------- }
 function MakeHelperArc(Board         : IPCB_Board;
                        TargetLayer   : TLayer;
@@ -89,52 +84,203 @@ var
   A : IPCB_Arc;
 begin
   A            := PCBServer.PCBObjectFactory(eArcObject, eNoDimension, eCreate_Default);
-  A.XCenter    := CX;
-  A.YCenter    := CY;
+  A.XCenter    := CX;  A.YCenter := CY;
   A.Radius     := ArcRadius;
   A.StartAngle := StartAngleDeg;
   A.EndAngle   := EndAngleDeg;
   A.Layer      := TargetLayer;
   A.LineWidth  := LineWidth;
-
   Board.AddPCBObject(A);
   PCBServer.SendMessageToRobots(
     Board.I_ObjectAddress, c_Broadcast, PCBM_BoardRegisteration, A.I_ObjectAddress);
-
   Result := A;
 end;
 
 
 { ---------------------------------------------------------------------------
-  GetSelectedObject
-  Finds exactly one selected track or arc on the Top or Bottom copper layer.
-  Returns True and sets either Track or Arc (the other is left Nil).
-  Displays an error and returns False if the selection is invalid.
+  ShowParamDialog
   --------------------------------------------------------------------------- }
-function GetSelectedObject(Board     : IPCB_Board;
-                           var Track : IPCB_Track;
-                           var Arc   : IPCB_Arc) : Boolean;
+procedure ShowParamDialog(var Expansion   : Double;
+                          var LeftOffset  : Double;
+                          var RightOffset : Double;
+                          var Cancelled   : Boolean);
 var
-  Iter     : IPCB_BoardIterator;
-  Obj      : IPCB_Primitive;
-  SelCount : Integer;
+  Dlg          : TForm;
+  LblExp, LblLeft, LblRight, LblNote : TLabel;
+  EdtExp, EdtLeft, EdtRight : TEdit;
+  BtnOK, BtnCancel : TButton;
+  ParsedVal    : Double;
+  ValidationOK : Boolean;
 begin
-  Result   := False;
-  Track    := Nil;
-  Arc      := Nil;
-  SelCount := 0;
+  Expansion := 0;  LeftOffset := 0;  RightOffset := 0;  Cancelled := True;
+  Dlg := TForm.Create(Nil);
+  try
+    Dlg.Caption     := 'Solder Mask Region – Parameters';
+    Dlg.Width       := 360;
+    Dlg.Height      := 270;
+    Dlg.Position    := poScreenCenter;
+    Dlg.BorderStyle := bsDialog;
+
+    LblExp := TLabel.Create(Dlg);  LblExp.Parent := Dlg;
+    LblExp.Caption := 'Expansion (mils):';  LblExp.Left := 16;  LblExp.Top := 22;
+
+    EdtExp := TEdit.Create(Dlg);  EdtExp.Parent := Dlg;
+    EdtExp.Left := 210;  EdtExp.Top := 18;  EdtExp.Width := 110;  EdtExp.Text := '0';
+
+    LblLeft := TLabel.Create(Dlg);  LblLeft.Parent := Dlg;
+    LblLeft.Caption := 'Left offset, mils (tracks only):';
+    LblLeft.Left := 16;  LblLeft.Top := 62;
+
+    EdtLeft := TEdit.Create(Dlg);  EdtLeft.Parent := Dlg;
+    EdtLeft.Left := 210;  EdtLeft.Top := 58;  EdtLeft.Width := 110;  EdtLeft.Text := '0';
+
+    LblRight := TLabel.Create(Dlg);  LblRight.Parent := Dlg;
+    LblRight.Caption := 'Right offset, mils (tracks only):';
+    LblRight.Left := 16;  LblRight.Top := 102;
+
+    EdtRight := TEdit.Create(Dlg);  EdtRight.Parent := Dlg;
+    EdtRight.Left := 210;  EdtRight.Top := 98;  EdtRight.Width := 110;  EdtRight.Text := '0';
+
+    LblNote := TLabel.Create(Dlg);  LblNote.Parent := Dlg;
+    LblNote.Caption := '"Left" = chain end with more-negative X coordinate.';
+    LblNote.Left := 16;  LblNote.Top := 142;  LblNote.Width := 320;
+
+    BtnOK := TButton.Create(Dlg);  BtnOK.Parent := Dlg;
+    BtnOK.Caption := 'OK';  BtnOK.Left := 150;  BtnOK.Top := 192;
+    BtnOK.Width := 80;  BtnOK.ModalResult := mrOK;  BtnOK.Default := True;
+
+    BtnCancel := TButton.Create(Dlg);  BtnCancel.Parent := Dlg;
+    BtnCancel.Caption := 'Cancel';  BtnCancel.Left := 244;  BtnCancel.Top := 192;
+    BtnCancel.Width := 80;  BtnCancel.ModalResult := mrCancel;  BtnCancel.Cancel := True;
+
+    ValidationOK := False;
+    while not ValidationOK do
+    begin
+      if Dlg.ShowModal <> mrOK then Exit;
+      ValidationOK := True;
+
+      ParsedVal := StrToFloatDef(EdtExp.Text, -1);
+      if ParsedVal < 0 then begin ShowMessage('Expansion must be a non-negative number.'); ValidationOK := False; Continue; end;
+      Expansion := ParsedVal;
+
+      ParsedVal := StrToFloatDef(EdtLeft.Text, -1);
+      if ParsedVal < 0 then begin ShowMessage('Left offset must be a non-negative number.'); ValidationOK := False; Continue; end;
+      LeftOffset := ParsedVal;
+
+      ParsedVal := StrToFloatDef(EdtRight.Text, -1);
+      if ParsedVal < 0 then begin ShowMessage('Right offset must be a non-negative number.'); ValidationOK := False; Continue; end;
+      RightOffset := ParsedVal;
+    end;
+    Cancelled := False;
+  finally
+    Dlg.Free;
+  end;
+end;
+
+
+{ ===========================================================================
+  DrawSolderMaskRegion  –  SCRIPT ENTRY POINT
+  =========================================================================== }
+procedure DrawSolderMaskRegion;
+const
+  MAX_PRIMS = 50;
+  ENDPT_TOL = 0.5;   { endpoint-matching tolerance in mils }
+
+var
+  Board       : IPCB_Board;
+  TargetLayer : TLayer;
+  Expansion   : Double;
+  LeftOffset  : Double;
+  RightOffset : Double;
+  Cancelled   : Boolean;
+
+  { ---- Primitive parallel arrays ---- }
+  PrimCount   : Integer;
+  { true = track, false = arc }
+  PrimIsTrack : array[0..MAX_PRIMS-1] of Boolean;
+  PrimTrack   : array[0..MAX_PRIMS-1] of IPCB_Track;
+  PrimArc     : array[0..MAX_PRIMS-1] of IPCB_Arc;
+  { Primitive layer (all should be the same copper layer) }
+  PrimLayer   : array[0..MAX_PRIMS-1] of TLayer;
+  { Endpoint coordinates in TCoord (natural: X1/Y1 for tracks, StartAngle point for arcs) }
+  PrimSX, PrimSY : array[0..MAX_PRIMS-1] of TCoord;
+  PrimEX, PrimEY : array[0..MAX_PRIMS-1] of TCoord;
+  { Adjacency: index of the primitive connected at each end; -1 = external }
+  PrimSAdj, PrimEAdj : array[0..MAX_PRIMS-1] of Integer;
+
+  { ---- External-endpoint arrays (up to MAX_PRIMS*2 theoretical, 10 typical) ---- }
+  ExtCount             : Integer;
+  ExtX, ExtY           : array[0..9] of TCoord;
+  ExtPrimIdx           : array[0..9] of Integer;
+  ExtIsStart           : array[0..9] of Boolean;
+
+  { ---- Chain left/right identification ---- }
+  LeftPrimIdx, RightPrimIdx : Integer;
+  LeftIsStart, RightIsStart : Boolean;
+  SimpleChain               : Boolean;   { exactly 2 external endpoints }
+
+  { ---- Loop / temp variables ---- }
+  Iter       : IPCB_BoardIterator;
+  Obj        : IPCB_Primitive;
+  i, j, k    : Integer;
+  Tol        : TCoord;
+  FoundLayer : TLayer;
+  AllSame    : Boolean;
+
+  { ---- Per-primitive geometry (track) ---- }
+  SXm, SYm, EXm, EYm : Double;   { endpoints in mils }
+  deltaX, deltaY      : Double;
+  TrackAngle          : Double;
+  Ux, Uy, Vx, Vy     : Double;
+  Half, s_lo, e_ro    : Double;
+  ax, ay, bx, by      : Double;
+  cx, cy, dx, dy      : Double;
+  LineW               : TCoord;
+
+  { ---- Per-primitive geometry (arc) ---- }
+  HalfW              : TCoord;
+  OuterRadius        : TCoord;
+  InnerRadius        : TCoord;
+  StartRad, EndRad   : Double;
+  OStartX, OStartY   : TCoord;
+  OEndX,   OEndY     : TCoord;
+  IStartX, IStartY   : TCoord;
+  IEndX,   IEndY     : TCoord;
+
+begin
+  { ------------------------------------------------------------------ }
+  { 1. Obtain active PCB document                                        }
+  { ------------------------------------------------------------------ }
+  Board := PCBServer.GetCurrentPCBBoard;
+  if Board = Nil then
+  begin
+    ShowMessage('Error: No PCB document is currently active.');
+    Exit;
+  end;
+
+  { ------------------------------------------------------------------ }
+  { 2. Collect all selected tracks and arcs on a copper layer           }
+  { ------------------------------------------------------------------ }
+  PrimCount := 0;
 
   Iter := Board.BoardIterator_Create;
   Iter.AddFilter_ObjectSet(MkSet(eTrackObject));
   Iter.AddFilter_LayerSet(AllLayers);
   Obj := Iter.FirstPCBObject;
-  while Obj <> Nil do
+  while (Obj <> Nil) and (PrimCount < MAX_PRIMS) do
   begin
     if Obj.Selected then
       if (Obj.Layer = eTopLayer) or (Obj.Layer = eBottomLayer) then
       begin
-        Inc(SelCount);
-        Track := Obj;
+        PrimIsTrack[PrimCount] := True;
+        PrimTrack[PrimCount]   := Obj;
+        PrimArc[PrimCount]     := Nil;
+        PrimLayer[PrimCount]   := Obj.Layer;
+        PrimSX[PrimCount]      := Obj.X1;
+        PrimSY[PrimCount]      := Obj.Y1;
+        PrimEX[PrimCount]      := Obj.X2;
+        PrimEY[PrimCount]      := Obj.Y2;
+        Inc(PrimCount);
       end;
     Obj := Iter.NextPCBObject;
   end;
@@ -144,367 +290,309 @@ begin
   Iter.AddFilter_ObjectSet(MkSet(eArcObject));
   Iter.AddFilter_LayerSet(AllLayers);
   Obj := Iter.FirstPCBObject;
-  while Obj <> Nil do
+  while (Obj <> Nil) and (PrimCount < MAX_PRIMS) do
   begin
     if Obj.Selected then
       if (Obj.Layer = eTopLayer) or (Obj.Layer = eBottomLayer) then
       begin
-        Inc(SelCount);
-        Arc := Obj;
+        PrimIsTrack[PrimCount] := False;
+        PrimTrack[PrimCount]   := Nil;
+        PrimArc[PrimCount]     := Obj;
+        PrimLayer[PrimCount]   := Obj.Layer;
+        { Arc start/end points in TCoord }
+        StartRad := Obj.StartAngle * Pi / 180.0;
+        EndRad   := Obj.EndAngle   * Pi / 180.0;
+        PrimSX[PrimCount] := Round(Obj.XCenter + Obj.Radius * Cos(StartRad));
+        PrimSY[PrimCount] := Round(Obj.YCenter + Obj.Radius * Sin(StartRad));
+        PrimEX[PrimCount] := Round(Obj.XCenter + Obj.Radius * Cos(EndRad));
+        PrimEY[PrimCount] := Round(Obj.YCenter + Obj.Radius * Sin(EndRad));
+        Inc(PrimCount);
       end;
     Obj := Iter.NextPCBObject;
   end;
   Board.BoardIterator_Destroy(Iter);
 
-  if SelCount = 0 then
+  { ---- Validate ---- }
+  if PrimCount = 0 then
   begin
     ShowMessage(
-      'Error: No qualifying object selected.' + #13#10 + #13#10 +
-      'Please select exactly one track or arc on the Top or' + #13#10 +
-      'Bottom copper layer, then re-run the script.');
+      'Error: No tracks or arcs selected on the Top or Bottom copper layer.' + #13#10 +
+      'Please select one or more connected tracks/arcs and re-run.');
     Exit;
   end;
 
-  if SelCount > 1 then
+  if PrimCount > MAX_PRIMS then
   begin
-    ShowMessage(
-      'Error: Multiple objects are selected (' + IntToStr(SelCount) + ').' + #13#10 + #13#10 +
-      'Please select exactly one track or arc and re-run the script.');
+    ShowMessage('Error: Selection contains more than ' + IntToStr(MAX_PRIMS) + ' primitives.');
     Exit;
   end;
 
-  if (Track <> Nil) and (Arc <> Nil) then Arc := Nil;
-  Result := True;
-end;
+  { All primitives must be on the same copper layer }
+  FoundLayer := PrimLayer[0];
+  AllSame := True;
+  for i := 1 to PrimCount - 1 do
+    if PrimLayer[i] <> FoundLayer then begin AllSame := False; Break; end;
 
-
-{ ---------------------------------------------------------------------------
-  ShowParamDialog
-  Collects Expansion, Left Offset, and Right Offset from the user (mils).
-  --------------------------------------------------------------------------- }
-procedure ShowParamDialog(var Expansion   : Double;
-                          var LeftOffset  : Double;
-                          var RightOffset : Double;
-                          var Cancelled   : Boolean);
-var
-  Dlg          : TForm;
-  LblExp       : TLabel;
-  LblLeft      : TLabel;
-  LblRight     : TLabel;
-  LblNote      : TLabel;
-  EdtExp       : TEdit;
-  EdtLeft      : TEdit;
-  EdtRight     : TEdit;
-  BtnOK        : TButton;
-  BtnCancel    : TButton;
-  ParsedVal    : Double;
-  ValidationOK : Boolean;
-begin
-  Expansion   := 0;
-  LeftOffset  := 0;
-  RightOffset := 0;
-  Cancelled   := True;
-
-  Dlg := TForm.Create(Nil);
-  try
-    Dlg.Caption     := 'Solder Mask Region – Parameters';
-    Dlg.Width       := 360;
-    Dlg.Height      := 270;
-    Dlg.Position    := poScreenCenter;
-    Dlg.BorderStyle := bsDialog;
-
-    LblExp         := TLabel.Create(Dlg);
-    LblExp.Parent  := Dlg;
-    LblExp.Caption := 'Expansion (mils):';
-    LblExp.Left    := 16;
-    LblExp.Top     := 22;
-
-    EdtExp        := TEdit.Create(Dlg);
-    EdtExp.Parent := Dlg;
-    EdtExp.Left   := 210;
-    EdtExp.Top    := 18;
-    EdtExp.Width  := 110;
-    EdtExp.Text   := '0';
-
-    LblLeft         := TLabel.Create(Dlg);
-    LblLeft.Parent  := Dlg;
-    LblLeft.Caption := 'Left offset, mils (tracks only):';
-    LblLeft.Left    := 16;
-    LblLeft.Top     := 62;
-
-    EdtLeft        := TEdit.Create(Dlg);
-    EdtLeft.Parent := Dlg;
-    EdtLeft.Left   := 210;
-    EdtLeft.Top    := 58;
-    EdtLeft.Width  := 110;
-    EdtLeft.Text   := '0';
-
-    LblRight         := TLabel.Create(Dlg);
-    LblRight.Parent  := Dlg;
-    LblRight.Caption := 'Right offset, mils (tracks only):';
-    LblRight.Left    := 16;
-    LblRight.Top     := 102;
-
-    EdtRight        := TEdit.Create(Dlg);
-    EdtRight.Parent := Dlg;
-    EdtRight.Left   := 210;
-    EdtRight.Top    := 98;
-    EdtRight.Width  := 110;
-    EdtRight.Text   := '0';
-
-    LblNote         := TLabel.Create(Dlg);
-    LblNote.Parent  := Dlg;
-    LblNote.Caption := '"Left" = more-negative X (or bottom for vertical tracks).';
-    LblNote.Left    := 16;
-    LblNote.Top     := 142;
-    LblNote.Width   := 320;
-
-    BtnOK             := TButton.Create(Dlg);
-    BtnOK.Parent      := Dlg;
-    BtnOK.Caption     := 'OK';
-    BtnOK.Left        := 150;
-    BtnOK.Top         := 192;
-    BtnOK.Width       := 80;
-    BtnOK.ModalResult := mrOK;
-    BtnOK.Default     := True;
-
-    BtnCancel             := TButton.Create(Dlg);
-    BtnCancel.Parent      := Dlg;
-    BtnCancel.Caption     := 'Cancel';
-    BtnCancel.Left        := 244;
-    BtnCancel.Top         := 192;
-    BtnCancel.Width       := 80;
-    BtnCancel.ModalResult := mrCancel;
-    BtnCancel.Cancel      := True;
-
-    ValidationOK := False;
-    while not ValidationOK do
-    begin
-      if Dlg.ShowModal <> mrOK then Exit;
-      ValidationOK := True;
-
-      ParsedVal := StrToFloatDef(EdtExp.Text, -1);
-      if ParsedVal < 0 then
-      begin
-        ShowMessage('Expansion must be a non-negative number (e.g. 25 or 25.4).');
-        ValidationOK := False; Continue;
-      end;
-      Expansion := ParsedVal;
-
-      ParsedVal := StrToFloatDef(EdtLeft.Text, -1);
-      if ParsedVal < 0 then
-      begin
-        ShowMessage('Left offset must be a non-negative number.');
-        ValidationOK := False; Continue;
-      end;
-      LeftOffset := ParsedVal;
-
-      ParsedVal := StrToFloatDef(EdtRight.Text, -1);
-      if ParsedVal < 0 then
-      begin
-        ShowMessage('Right offset must be a non-negative number.');
-        ValidationOK := False; Continue;
-      end;
-      RightOffset := ParsedVal;
-    end;
-
-    Cancelled := False;
-  finally
-    Dlg.Free;
-  end;
-end;
-
-
-{ ---------------------------------------------------------------------------
-  DrawTrackHelpers
-  Computes the four rotated rectangle corners for a track and places four
-  helper track segments on TargetLayer connecting them (A→B→C→D→A).
-
-  All track properties are converted to mils via CoordToMils at the top.
-  Geometry is computed in mils as Double.  Corners are converted back to
-  TCoord via MilsToCoord only at the final MakeHelperTrack call.
-
-  deltaX / deltaY name the along-track direction vector.  These do not
-  collide with the corner variables ax/ay … dx/dy in DelphiScript's
-  case-insensitive environment because "deltaX" ≠ "dx".
-  --------------------------------------------------------------------------- }
-procedure DrawTrackHelpers(Board       : IPCB_Board;
-                           Track       : IPCB_Track;
-                           TargetLayer : TLayer;
-                           Expansion   : Double;
-                           LeftOffset  : Double;
-                           RightOffset : Double);
-var
-  Lx, Ly, Rx, Ry  : Double;
-  deltaX, deltaY  : Double;
-  TrackAngle      : Double;
-  ux, uy, vx, vy : Double;
-  Half, Lo, Ro    : Double;
-  ax, ay          : Double;
-  bx, by          : Double;
-  cx, cy          : Double;
-  dx, dy          : Double;
-  LineW           : TCoord;
-begin
-  if (Track.X1 < Track.X2) or
-     ((Track.X1 = Track.X2) and (Track.Y1 < Track.Y2)) then
+  if not AllSame then
   begin
-    Lx := CoordToMils(Track.X1);  Ly := CoordToMils(Track.Y1);
-    Rx := CoordToMils(Track.X2);  Ry := CoordToMils(Track.Y2);
-  end
+    ShowMessage(
+      'Error: All selected primitives must be on the same copper layer.' + #13#10 +
+      'Mixed Top/Bottom selections are not supported.');
+    Exit;
+  end;
+
+  { ------------------------------------------------------------------ }
+  { 3. Resolve target solder-mask layer                                  }
+  { ------------------------------------------------------------------ }
+  if FoundLayer = eTopLayer then
+    TargetLayer := eTopSolder
   else
-  begin
-    Lx := CoordToMils(Track.X2);  Ly := CoordToMils(Track.Y2);
-    Rx := CoordToMils(Track.X1);  Ry := CoordToMils(Track.Y1);
-  end;
+    TargetLayer := eBottomSolder;
 
-  deltaX := Rx - Lx;
-  deltaY := Ry - Ly;
-
-  if (Abs(deltaX) < 0.001) and (Abs(deltaY) < 0.001) then
-  begin
-    ShowMessage('Warning: The selected track has zero (or near-zero) length. Skipped.');
-    Exit;
-  end;
-
-  TrackAngle := ArcTan2(deltaY, deltaX);
-  ux :=  Cos(TrackAngle);
-  uy :=  Sin(TrackAngle);
-  vx :=  Cos(TrackAngle + Pi / 2);
-  vy :=  Sin(TrackAngle + Pi / 2);
-
-  Half := CoordToMils(Track.Width) / 2.0 + Expansion;
-  Lo   := LeftOffset;
-  Ro   := RightOffset;
-
-  ax := Lx + Lo * ux + Half * vx;  ay := Ly + Lo * uy + Half * vy;
-  bx := Rx - Ro * ux + Half * vx;  by := Ry - Ro * uy + Half * vy;
-  cx := Rx - Ro * ux - Half * vx;  cy := Ry - Ro * uy - Half * vy;
-  dx := Lx + Lo * ux - Half * vx;  dy := Ly + Lo * uy - Half * vy;
-
-  LineW := MilsToCoord(1);
-
-  PCBServer.PreProcess;
-  MakeHelperTrack(Board, TargetLayer,
-    MilsToCoord(ax), MilsToCoord(ay), MilsToCoord(bx), MilsToCoord(by), LineW);
-  MakeHelperTrack(Board, TargetLayer,
-    MilsToCoord(bx), MilsToCoord(by), MilsToCoord(cx), MilsToCoord(cy), LineW);
-  MakeHelperTrack(Board, TargetLayer,
-    MilsToCoord(cx), MilsToCoord(cy), MilsToCoord(dx), MilsToCoord(dy), LineW);
-  MakeHelperTrack(Board, TargetLayer,
-    MilsToCoord(dx), MilsToCoord(dy), MilsToCoord(ax), MilsToCoord(ay), LineW);
-  PCBServer.PostProcess;
-end;
-
-
-{ ---------------------------------------------------------------------------
-  DrawArcHelpers
-  Places two concentric arcs and two closing track segments on TargetLayer
-  outlining the solder mask opening for a copper arc.
-
-  Outer arc radius = CopperRadius + CopperLineWidth/2 + Expansion
-  Inner arc radius = CopperRadius - CopperLineWidth/2 - Expansion
-  Both arcs share the copper arc's centre, start angle, and end angle.
-  Closing tracks connect the outer and inner arc endpoints at each end.
-  --------------------------------------------------------------------------- }
-procedure DrawArcHelpers(Board          : IPCB_Board;
-                         Arc            : IPCB_Arc;
-                         TargetLayer    : TLayer;
-                         ExpansionCoord : TCoord);
-var
-  HalfWidth        : TCoord;
-  OuterRadius      : TCoord;
-  InnerRadius      : TCoord;
-  StartRad         : Double;
-  EndRad           : Double;
-  OStartX, OStartY : TCoord;
-  OEndX,   OEndY   : TCoord;
-  IStartX, IStartY : TCoord;
-  IEndX,   IEndY   : TCoord;
-begin
-  HalfWidth   := Arc.LineWidth div 2;
-  OuterRadius := Arc.Radius + HalfWidth + ExpansionCoord;
-  InnerRadius := Arc.Radius - HalfWidth - ExpansionCoord;
-
-  if InnerRadius <= 0 then
-  begin
-    ShowMessage(
-      'Warning: Expansion value is too large — inner arc radius would be' + #13#10 +
-      'zero or negative.  Please use a smaller expansion.');
-    Exit;
-  end;
-
-  StartRad := Arc.StartAngle * Pi / 180.0;
-  EndRad   := Arc.EndAngle   * Pi / 180.0;
-
-  OStartX := Round(Arc.XCenter + OuterRadius * Cos(StartRad));
-  OStartY := Round(Arc.YCenter + OuterRadius * Sin(StartRad));
-  OEndX   := Round(Arc.XCenter + OuterRadius * Cos(EndRad));
-  OEndY   := Round(Arc.YCenter + OuterRadius * Sin(EndRad));
-
-  IStartX := Round(Arc.XCenter + InnerRadius * Cos(StartRad));
-  IStartY := Round(Arc.YCenter + InnerRadius * Sin(StartRad));
-  IEndX   := Round(Arc.XCenter + InnerRadius * Cos(EndRad));
-  IEndY   := Round(Arc.YCenter + InnerRadius * Sin(EndRad));
-
-  PCBServer.PreProcess;
-  MakeHelperArc(Board, TargetLayer,
-    Arc.XCenter, Arc.YCenter, OuterRadius,
-    Arc.StartAngle, Arc.EndAngle, MilsToCoord(0.5));
-  MakeHelperArc(Board, TargetLayer,
-    Arc.XCenter, Arc.YCenter, InnerRadius,
-    Arc.StartAngle, Arc.EndAngle, MilsToCoord(0.5));
-  MakeHelperTrack(Board, TargetLayer,
-    OStartX, OStartY, IStartX, IStartY, MilsToCoord(1));
-  MakeHelperTrack(Board, TargetLayer,
-    OEndX, OEndY, IEndX, IEndY, MilsToCoord(1));
-  PCBServer.PostProcess;
-end;
-
-
-{ ===========================================================================
-  DrawSolderMaskRegion  –  SCRIPT ENTRY POINT
-  =========================================================================== }
-procedure DrawSolderMaskRegion;
-var
-  Board       : IPCB_Board;
-  Track       : IPCB_Track;
-  Arc         : IPCB_Arc;
-  TargetLayer : TLayer;
-  SourceLayer : TLayer;
-  Expansion   : Double;
-  LeftOffset  : Double;
-  RightOffset : Double;
-  Cancelled   : Boolean;
-begin
-  Board := PCBServer.GetCurrentPCBBoard;
-  if Board = Nil then
-  begin
-    ShowMessage('Error: No PCB document is currently active.' + #13#10 +
-                'Please open a PCB file before running this script.');
-    Exit;
-  end;
-
-  Track := Nil;
-  Arc   := Nil;
-  if not GetSelectedObject(Board, Track, Arc) then Exit;
-
-  if Track <> Nil then SourceLayer := Track.Layer
-  else               SourceLayer := Arc.Layer;
-
-  if SourceLayer = eTopLayer then TargetLayer := eTopSolder
-  else                            TargetLayer := eBottomSolder;
-
+  { ------------------------------------------------------------------ }
+  { 4. Collect parameters                                                }
+  { ------------------------------------------------------------------ }
   ShowParamDialog(Expansion, LeftOffset, RightOffset, Cancelled);
   if Cancelled then Exit;
 
-  if Track <> Nil then
-    DrawTrackHelpers(Board, Track, TargetLayer, Expansion, LeftOffset, RightOffset)
-  else
-    DrawArcHelpers(Board, Arc, TargetLayer, MilsToCoord(Expansion));
+  { ------------------------------------------------------------------ }
+  { 5. Build endpoint connectivity                                        }
+  { ------------------------------------------------------------------ }
+  { Initialise: all endpoints are external }
+  for i := 0 to PrimCount - 1 do
+  begin
+    PrimSAdj[i] := -1;
+    PrimEAdj[i] := -1;
+  end;
 
+  Tol := MilsToCoord(ENDPT_TOL);
+
+  for i := 0 to PrimCount - 2 do
+    for j := i + 1 to PrimCount - 1 do
+    begin
+      { Test all four endpoint-pair combinations }
+
+      { i.start — j.start }
+      if (Abs(PrimSX[i] - PrimSX[j]) <= Tol) and
+         (Abs(PrimSY[i] - PrimSY[j]) <= Tol) then
+      begin
+        PrimSAdj[i] := j;  PrimSAdj[j] := i;
+      end;
+
+      { i.start — j.end }
+      if (Abs(PrimSX[i] - PrimEX[j]) <= Tol) and
+         (Abs(PrimSY[i] - PrimEY[j]) <= Tol) then
+      begin
+        PrimSAdj[i] := j;  PrimEAdj[j] := i;
+      end;
+
+      { i.end — j.start }
+      if (Abs(PrimEX[i] - PrimSX[j]) <= Tol) and
+         (Abs(PrimEY[i] - PrimSY[j]) <= Tol) then
+      begin
+        PrimEAdj[i] := j;  PrimSAdj[j] := i;
+      end;
+
+      { i.end — j.end }
+      if (Abs(PrimEX[i] - PrimEX[j]) <= Tol) and
+         (Abs(PrimEY[i] - PrimEY[j]) <= Tol) then
+      begin
+        PrimEAdj[i] := j;  PrimEAdj[j] := i;
+      end;
+    end;
+
+  { ------------------------------------------------------------------ }
+  { 6. Find external endpoints and identify left/right chain ends        }
+  { ------------------------------------------------------------------ }
+  ExtCount := 0;
+  for i := 0 to PrimCount - 1 do
+  begin
+    if (PrimSAdj[i] = -1) and (ExtCount < 10) then
+    begin
+      ExtX[ExtCount]       := PrimSX[i];
+      ExtY[ExtCount]       := PrimSY[i];
+      ExtPrimIdx[ExtCount] := i;
+      ExtIsStart[ExtCount] := True;
+      Inc(ExtCount);
+    end;
+    if (PrimEAdj[i] = -1) and (ExtCount < 10) then
+    begin
+      ExtX[ExtCount]       := PrimEX[i];
+      ExtY[ExtCount]       := PrimEY[i];
+      ExtPrimIdx[ExtCount] := i;
+      ExtIsStart[ExtCount] := False;
+      Inc(ExtCount);
+    end;
+  end;
+
+  SimpleChain      := (ExtCount = 2);
+  LeftPrimIdx      := -1;
+  RightPrimIdx     := -1;
+  LeftIsStart      := False;
+  RightIsStart     := False;
+
+  if SimpleChain then
+  begin
+    { Assign left = more-negative X; tiebreak on more-negative Y }
+    if (ExtX[0] < ExtX[1]) or
+       ((ExtX[0] = ExtX[1]) and (ExtY[0] < ExtY[1])) then
+    begin
+      LeftPrimIdx  := ExtPrimIdx[0];  LeftIsStart  := ExtIsStart[0];
+      RightPrimIdx := ExtPrimIdx[1];  RightIsStart := ExtIsStart[1];
+    end
+    else
+    begin
+      LeftPrimIdx  := ExtPrimIdx[1];  LeftIsStart  := ExtIsStart[1];
+      RightPrimIdx := ExtPrimIdx[0];  RightIsStart := ExtIsStart[0];
+    end;
+  end;
+
+  { ------------------------------------------------------------------ }
+  { 7. Place all helper primitives                                        }
+  { ------------------------------------------------------------------ }
+  PCBServer.PreProcess;
+
+  for i := 0 to PrimCount - 1 do
+  begin
+    { --- Determine per-end offsets (mils) ---
+      An offset applies only when:
+        (a) the end is external (no adjacent primitive),
+        (b) this primitive is a track,
+        (c) this end is the chain's left or right end (SimpleChain only),
+        (d) LeftOffset / RightOffset is non-zero. }
+    s_lo := 0;
+    e_ro := 0;
+
+    if PrimIsTrack[i] and SimpleChain then
+    begin
+      if (PrimSAdj[i] = -1) then   { start is external }
+      begin
+        if (i = LeftPrimIdx)  and LeftIsStart  then s_lo := LeftOffset;
+        if (i = RightPrimIdx) and RightIsStart then s_lo := RightOffset;
+      end;
+      if (PrimEAdj[i] = -1) then   { end is external }
+      begin
+        if (i = LeftPrimIdx)  and (not LeftIsStart)  then e_ro := LeftOffset;
+        if (i = RightPrimIdx) and (not RightIsStart) then e_ro := RightOffset;
+      end;
+    end;
+
+    { ============================================================ }
+    { TRACK case                                                    }
+    { ============================================================ }
+    if PrimIsTrack[i] then
+    begin
+      { Convert endpoints to mils }
+      SXm := CoordToMils(PrimSX[i]);  SYm := CoordToMils(PrimSY[i]);
+      EXm := CoordToMils(PrimEX[i]);  EYm := CoordToMils(PrimEY[i]);
+
+      deltaX := EXm - SXm;
+      deltaY := EYm - SYm;
+
+      if (Abs(deltaX) < 0.001) and (Abs(deltaY) < 0.001) then
+        Continue;   { skip zero-length track }
+
+      TrackAngle := ArcTan2(deltaY, deltaX);
+      Ux :=  Cos(TrackAngle);
+      Uy :=  Sin(TrackAngle);
+      Vx :=  Cos(TrackAngle + Pi / 2);
+      Vy :=  Sin(TrackAngle + Pi / 2);
+
+      Half := CoordToMils(PrimTrack[i].Width) / 2.0 + Expansion;
+
+      { Corner coordinates (mils).
+        s_lo moves the start short edge inward (along Ux toward E).
+        e_ro moves the end short edge inward (along -Ux toward S). }
+      ax := SXm + s_lo * Ux + Half * Vx;   { top-left  }
+      ay := SYm + s_lo * Uy + Half * Vy;
+      bx := EXm - e_ro * Ux + Half * Vx;   { top-right }
+      by := EYm - e_ro * Uy + Half * Vy;
+      cx := EXm - e_ro * Ux - Half * Vx;   { bot-right }
+      cy := EYm - e_ro * Uy - Half * Vy;
+      dx := SXm + s_lo * Ux - Half * Vx;   { bot-left  }
+      dy := SYm + s_lo * Uy - Half * Vy;
+
+      LineW := MilsToCoord(1);
+
+      { Top long edge: A → B (always) }
+      MakeHelperTrack(Board, TargetLayer,
+        MilsToCoord(ax), MilsToCoord(ay), MilsToCoord(bx), MilsToCoord(by), LineW);
+
+      { Bottom long edge: D → C (always) }
+      MakeHelperTrack(Board, TargetLayer,
+        MilsToCoord(dx), MilsToCoord(dy), MilsToCoord(cx), MilsToCoord(cy), LineW);
+
+      { Left short edge: A → D (only if start is external) }
+      if PrimSAdj[i] = -1 then
+        MakeHelperTrack(Board, TargetLayer,
+          MilsToCoord(ax), MilsToCoord(ay), MilsToCoord(dx), MilsToCoord(dy), LineW);
+
+      { Right short edge: B → C (only if end is external) }
+      if PrimEAdj[i] = -1 then
+        MakeHelperTrack(Board, TargetLayer,
+          MilsToCoord(bx), MilsToCoord(by), MilsToCoord(cx), MilsToCoord(cy), LineW);
+    end
+
+    { ============================================================ }
+    { ARC case                                                      }
+    { ============================================================ }
+    else
+    begin
+      HalfW       := PrimArc[i].LineWidth div 2;
+      OuterRadius := PrimArc[i].Radius + HalfW + MilsToCoord(Expansion);
+      InnerRadius := PrimArc[i].Radius - HalfW - MilsToCoord(Expansion);
+
+      if InnerRadius <= 0 then
+      begin
+        ShowMessage(
+          'Warning: Expansion too large for arc ' + IntToStr(i) +
+          ' — inner radius would be zero or negative.  Arc skipped.');
+        Continue;
+      end;
+
+      StartRad := PrimArc[i].StartAngle * Pi / 180.0;
+      EndRad   := PrimArc[i].EndAngle   * Pi / 180.0;
+
+      OStartX := Round(PrimArc[i].XCenter + OuterRadius * Cos(StartRad));
+      OStartY := Round(PrimArc[i].YCenter + OuterRadius * Sin(StartRad));
+      OEndX   := Round(PrimArc[i].XCenter + OuterRadius * Cos(EndRad));
+      OEndY   := Round(PrimArc[i].YCenter + OuterRadius * Sin(EndRad));
+
+      IStartX := Round(PrimArc[i].XCenter + InnerRadius * Cos(StartRad));
+      IStartY := Round(PrimArc[i].YCenter + InnerRadius * Sin(StartRad));
+      IEndX   := Round(PrimArc[i].XCenter + InnerRadius * Cos(EndRad));
+      IEndY   := Round(PrimArc[i].YCenter + InnerRadius * Sin(EndRad));
+
+      { Outer arc (always) }
+      MakeHelperArc(Board, TargetLayer,
+        PrimArc[i].XCenter, PrimArc[i].YCenter, OuterRadius,
+        PrimArc[i].StartAngle, PrimArc[i].EndAngle, MilsToCoord(0.5));
+
+      { Inner arc (always) }
+      MakeHelperArc(Board, TargetLayer,
+        PrimArc[i].XCenter, PrimArc[i].YCenter, InnerRadius,
+        PrimArc[i].StartAngle, PrimArc[i].EndAngle, MilsToCoord(0.5));
+
+      { Start closing line: outer-start → inner-start (only if start is external) }
+      if PrimSAdj[i] = -1 then
+        MakeHelperTrack(Board, TargetLayer,
+          OStartX, OStartY, IStartX, IStartY, MilsToCoord(1));
+
+      { End closing line: outer-end → inner-end (only if end is external) }
+      if PrimEAdj[i] = -1 then
+        MakeHelperTrack(Board, TargetLayer,
+          OEndX, OEndY, IEndX, IEndY, MilsToCoord(1));
+    end;
+
+  end; { for i }
+
+  PCBServer.PostProcess;
   Board.ViewManager_FullUpdate;
 
   ShowMessage(
-    'Helper primitives placed on: ' + Board.LayerName(TargetLayer));
+    IntToStr(PrimCount) + ' primitive(s) processed.' + #13#10 +
+    'Helpers placed on: ' + Board.LayerName(TargetLayer) + #13#10 +
+    #13#10 +
+    'Internal closing edges have been suppressed.' + #13#10 +
+    'Close any corner gaps manually, then convert to a region.');
 end;
